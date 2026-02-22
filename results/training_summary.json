@@ -1,0 +1,57 @@
+{
+  "timestamp": "2026-02-22 23:03:21",
+  "config": {
+    "seq_length": 5,
+    "seq_overlap": 2,
+    "num_features": 30,
+    "num_classes": 4,
+    "epochs": 100,
+    "batch_size": 32
+  },
+  "data": {
+    "total_windows": 104,
+    "total_sequences": 34,
+    "num_users": 1,
+    "num_sessions": 1,
+    "train_sequences": 21,
+    "val_sequences": 6,
+    "test_sequences": 7,
+    "feature_columns": [
+      "mean_hr_bpm",
+      "hr_std_bpm",
+      "hr_min_bpm",
+      "hr_max_bpm",
+      "hr_range_bpm",
+      "hr_slope_bpm_per_s",
+      "nn_quality_ratio",
+      "sdnn_ms",
+      "rmssd_ms",
+      "pnn50_pct",
+      "mean_nn_ms",
+      "cv_nn",
+      "lf_power_ms2",
+      "hf_power_ms2",
+      "lf_hf_ratio",
+      "total_power_ms2",
+      "spo2_mean_pct",
+      "spo2_min_pct",
+      "spo2_std_pct",
+      "accel_x_mean",
+      "accel_y_mean",
+      "accel_z_mean",
+      "accel_x_var",
+      "accel_y_var",
+      "accel_z_var",
+      "accel_mag_mean",
+      "accel_mag_var",
+      "accel_peak",
+      "total_steps",
+      "cadence_spm"
+    ]
+  },
+  "base_model": {
+    "accuracy": 1.0,
+    "model_path": "models/base_fatigue_model.h5",
+    "tflite_path": "models/fatigue_model.tflite"
+  }
+}

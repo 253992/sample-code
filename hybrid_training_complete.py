@@ -650,6 +650,11 @@ def export_to_tflite(model_path, output_path):
     model = load_model(model_path)
     converter = tf.lite.TFLiteConverter.from_keras_model(model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS,
+        tf.lite.OpsSet.SELECT_TF_OPS,
+    ]
+    converter._experimental_lower_tensor_list_ops = False
     tflite_model = converter.convert()
 
     with open(output_path, 'wb') as f:
