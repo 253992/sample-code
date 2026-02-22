@@ -161,6 +161,30 @@ def load_and_preprocess_data(filepath, config):
     if 'timestamp' in df.columns:
         df = df.sort_values(['user_id', 'session_id', 'timestamp']).reset_index(drop=True)
 
+    # --- Drop rows with NaN labels ---
+    before = len(df)
+    df = df.dropna(subset=['fatigue_level']).reset_index(drop=True)
+    dropped = before - len(df)
+    if dropped > 0:
+        print(f"  Dropped {dropped} unlabeled rows ({dropped}/{before})")
+    df['fatigue_level'] = df['fatigue_level'].astype(int)
+
+    # --- Detect session boundaries from large time gaps ---
+    # Gaps > threshold within the same user/session are treated as
+    # separate segments. Sequences never cross segment boundaries.
+    SESSION_GAP_THRESHOLD_S = 45.0
+    df['segment_id'] = 0
+    for (uid, sid), group in df.groupby(['user_id', 'session_id']):
+        if len(group) < 2:
+            continue
+        gaps_s = group['timestamp'].diff() / 1000.0
+        boundaries = gaps_s > SESSION_GAP_THRESHOLD_S
+        seg_ids = boundaries.cumsum().astype(int)
+        # Make segment_id unique across groups by combining session + segment
+        df.loc[group.index, 'segment_id'] = seg_ids
+    # Combine session_id and segment_id for unique grouping
+    df['session_segment'] = df['session_id'] + '_seg_' + df['segment_id'].astype(str)
+
     # --- Summary ---
     print(f"  Loaded {len(df)} window summaries")
     print(f"  Users: {df['user_id'].nunique()}")
@@ -272,10 +296,10 @@ def create_sequences(df, config, scaler):
     X_sequences = []
     y_labels = []
 
-    # Group by user + session to avoid mixing sessions
-    groups = df.groupby(['user_id', 'session_id'])
+    # Group by user + session + segment to avoid crossing boundaries
+    groups = df.groupby(['user_id', 'session_segment'])
 
-    for (user_id, session_id), group in groups:
+    for (user_id, session_segment), group in groups:
         # Normalize features
         X_raw = group[config.FEATURE_COLUMNS].values
         X_scaled = scaler.transform(X_raw)
