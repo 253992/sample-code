@@ -1,0 +1,9 @@
+{
+  "user_id": "user_01",
+  "n_windows": 100,
+  "n_sequences": 32,
+  "accuracy_global": 0.8571428571428571,
+  "accuracy_user_norm": 0.8571428571428571,
+  "accuracy_fine_tuned": 1.0,
+  "best_approach": "fine_tuned"
+}
