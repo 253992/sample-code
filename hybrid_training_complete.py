@@ -54,7 +54,20 @@ class Config:
     SEQ_OVERLAP = 2  # Overlapping windows between sequences for data augmentation
 
     # --- Classification ---
-    NUM_CLASSES = 4  # 0=Mild, 1=Moderate, 2=High, 3=Critical
+    # Binary: 0=Low fatigue (RPE 0-4), 1=High fatigue (RPE 5-10)
+    # The model outputs P(High), which is mapped to 4 app-facing levels
+    # using FATIGUE_THRESHOLDS in the Android app.
+    NUM_CLASSES = 2
+    BINARY_LABEL_MAP = {0: 0, 1: 0, 2: 1, 3: 1}  # Original 4-class → binary
+
+    # App-side thresholds: P(High) → 4 fatigue levels for display
+    # These are saved to scaler_params.json for Android to use
+    FATIGUE_THRESHOLDS = {
+        'mild_max':     0.25,  # P(High) < 0.25 → Mild (level 0)
+        'moderate_max': 0.50,  # P(High) < 0.50 → Moderate (level 1)
+        'high_max':     0.75,  # P(High) < 0.75 → High (level 2)
+                               # P(High) >= 0.75 → Critical (level 3)
+    }
 
     # --- Feature columns (33 model inputs) ---
     FEATURE_COLUMNS = [
@@ -93,7 +106,7 @@ class Config:
     FINETUNE_LR = 0.0001
 
     # --- File paths ---
-    DATA_PATH = "features.csv"
+    DATA_PATH = "dataset.csv"
     BASE_MODEL_PATH = "models/base_fatigue_model.h5"
     TFLITE_MODEL_PATH = "models/fatigue_model.tflite"
 
@@ -169,6 +182,13 @@ def load_and_preprocess_data(filepath, config):
         print(f"  Dropped {dropped} unlabeled rows ({dropped}/{before})")
     df['fatigue_level'] = df['fatigue_level'].astype(int)
 
+    # --- Remap to binary labels ---
+    # Original: 0=Mild, 1=Moderate, 2=High, 3=Critical
+    # Binary:   0=Low (Mild+Moderate), 1=High (High+Critical)
+    df['fatigue_level_original'] = df['fatigue_level']  # Keep original for analysis
+    df['fatigue_level'] = df['fatigue_level'].map(config.BINARY_LABEL_MAP)
+    print(f"  Remapped to binary: {df['fatigue_level'].value_counts().sort_index().to_dict()}")
+
     # --- Detect session boundaries from large time gaps ---
     # Gaps > threshold within the same user/session are treated as
     # separate segments. Sequences never cross segment boundaries.
@@ -217,6 +237,9 @@ def create_global_scaler(df, config):
         'mean': scaler.mean_.tolist(),
         'std': scaler.scale_.tolist(),
         'feature_names': config.FEATURE_COLUMNS,
+        'num_classes': config.NUM_CLASSES,
+        'fatigue_thresholds': config.FATIGUE_THRESHOLDS,
+        'fatigue_level_names': ['Mild', 'Moderate', 'High', 'Critical'],
     }
     with open('scalers/scaler_params.json', 'w') as f:
         json.dump(scaler_params, f, indent=2)
@@ -589,7 +612,7 @@ def evaluate_model(model, X_test, y_test, model_name="Model"):
     accuracy = accuracy_score(y_true, y_pred)
     print(f"\n  Accuracy: {accuracy:.4f} ({accuracy * 100:.2f}%)")
 
-    class_names = ["Mild", "Moderate", "High", "Critical"]
+    class_names = ["Low", "High"]
 
     # Only report on classes that appear in the data
     present_classes = sorted(set(y_true) | set(y_pred))
@@ -608,7 +631,7 @@ def evaluate_model(model, X_test, y_test, model_name="Model"):
     print(cm)
 
     # Plot confusion matrix
-    plt.figure(figsize=(8, 6))
+    plt.figure(figsize=(6, 5))
     sns.heatmap(
         cm, annot=True, fmt='d', cmap='Blues',
         xticklabels=class_names, yticklabels=class_names,
@@ -620,6 +643,21 @@ def evaluate_model(model, X_test, y_test, model_name="Model"):
     safe_name = model_name.lower().replace(" ", "_")
     plt.savefig(f'results/{safe_name}_confusion_matrix.png')
     plt.close()
+
+    # Show 4-level fatigue distribution from P(High) probabilities
+    if y_pred_probs.shape[1] == 2:
+        p_high = y_pred_probs[:, 1]
+        thresholds = config.FATIGUE_THRESHOLDS
+        fatigue_4class = np.where(
+            p_high < thresholds['mild_max'], 0,
+            np.where(p_high < thresholds['moderate_max'], 1,
+                     np.where(p_high < thresholds['high_max'], 2, 3)))
+        fatigue_names = ["Mild", "Moderate", "High", "Critical"]
+        unique_4, counts_4 = np.unique(fatigue_4class, return_counts=True)
+        print(f"\n  4-Level Fatigue Distribution (from P(High) thresholds):")
+        for u, c in zip(unique_4, counts_4):
+            print(f"    {fatigue_names[u]:>10s}: {c:>4d} ({c / len(fatigue_4class) * 100:.1f}%)")
+        print(f"  P(High) stats: mean={p_high.mean():.3f}, min={p_high.min():.3f}, max={p_high.max():.3f}")
 
     return {
         'accuracy': accuracy,
@@ -857,6 +895,9 @@ def main():
             'seq_overlap': config.SEQ_OVERLAP,
             'num_features': len(config.FEATURE_COLUMNS),
             'num_classes': config.NUM_CLASSES,
+            'classification': 'binary (Low vs High fatigue)',
+            'binary_label_map': config.BINARY_LABEL_MAP,
+            'fatigue_thresholds': config.FATIGUE_THRESHOLDS,
             'epochs': config.EPOCHS,
             'batch_size': config.BATCH_SIZE,
         },
@@ -901,6 +942,12 @@ def main():
     print(f"    2. Copy scalers/scaler_params.json → app/src/main/assets/")
     print(f"    3. Implement sequence buffering in Android (collect {config.SEQ_LENGTH}")
     print(f"       consecutive window summaries before running inference)")
+    print(f"    4. Model outputs [P(Low), P(High)] — use P(High) to determine")
+    print(f"       4 fatigue levels using thresholds in scaler_params.json:")
+    print(f"         P(High) < 0.25 → Mild")
+    print(f"         P(High) < 0.50 → Moderate")
+    print(f"         P(High) < 0.75 → High")
+    print(f"         P(High) >= 0.75 → Critical")
     print(f"\n  Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 

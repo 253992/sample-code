@@ -48,7 +48,15 @@ class Config:
 
     SEQ_LENGTH = 5
     SEQ_OVERLAP = 2
-    NUM_CLASSES = 4  # 0=Mild, 1=Moderate, 2=High, 3=Critical
+    NUM_CLASSES = 2  # Binary: 0=Low fatigue, 1=High fatigue
+    BINARY_LABEL_MAP = {0: 0, 1: 0, 2: 1, 3: 1}  # Original 4-class → binary
+
+    # App-side thresholds: P(High) → 4 fatigue levels for display
+    FATIGUE_THRESHOLDS = {
+        'mild_max':     0.25,
+        'moderate_max': 0.50,
+        'high_max':     0.75,
+    }
 
     # 30 features matching the current CSV schema (35 cols - 5 metadata/label cols)
     FEATURE_COLUMNS = [
@@ -125,6 +133,11 @@ def load_user_data(filepath, config):
 
     # Convert fatigue_level to int
     df['fatigue_level'] = df['fatigue_level'].astype(int)
+
+    # Remap to binary labels (must match hybrid_training_complete.py)
+    df['fatigue_level_original'] = df['fatigue_level']
+    df['fatigue_level'] = df['fatigue_level'].map(config.BINARY_LABEL_MAP)
+    print(f"  Remapped to binary: {df['fatigue_level'].value_counts().sort_index().to_dict()}")
 
     # Detect session boundaries from large time gaps
     if 'timestamp' in df.columns and len(df) > 1:
@@ -270,6 +283,9 @@ class UserPersonalization:
             'feature_names': config.FEATURE_COLUMNS,
             'mean': scaler.mean_.tolist(),
             'std': scaler.scale_.tolist(),
+            'num_classes': config.NUM_CLASSES,
+            'fatigue_thresholds': config.FATIGUE_THRESHOLDS,
+            'fatigue_level_names': ['Mild', 'Moderate', 'High', 'Critical'],
         }
         json_path = f'scalers/user_{user_id}_scaler.json'
         with open(json_path, 'w') as f:
@@ -392,7 +408,7 @@ class UserPersonalization:
         print(f"User: {user_id}")
         print(f"{'=' * 60}")
 
-        class_names = ["Mild", "Moderate", "High", "Critical"]
+        class_names = ["Low", "High"]
 
         # --- Create user scaler ---
         user_scaler = self.create_user_scaler(df, user_id)

@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-02-22 23:46:28",
+  "timestamp": "2026-03-23 16:39:42",
   "config": {
     "seq_length": 5,
     "seq_overlap": 2,
@@ -9,13 +9,13 @@
     "batch_size": 32
   },
   "data": {
-    "total_windows": 100,
-    "total_sequences": 32,
-    "num_users": 1,
+    "total_windows": 4070,
+    "total_sequences": 1326,
+    "num_users": 23,
     "num_sessions": 1,
-    "train_sequences": 20,
-    "val_sequences": 5,
-    "test_sequences": 7,
+    "train_sequences": 848,
+    "val_sequences": 212,
+    "test_sequences": 266,
     "feature_columns": [
       "mean_hr_bpm",
       "hr_std_bpm",
@@ -50,7 +50,7 @@
     ]
   },
   "base_model": {
-    "accuracy": 1.0,
+    "accuracy": 0.5902255639097744,
     "model_path": "models/base_fatigue_model.h5",
     "tflite_path": "models/fatigue_model.tflite"
   }
