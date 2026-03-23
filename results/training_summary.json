@@ -1,10 +1,22 @@
 {
-  "timestamp": "2026-03-23 16:39:42",
+  "timestamp": "2026-03-23 18:42:39",
   "config": {
     "seq_length": 5,
     "seq_overlap": 2,
     "num_features": 30,
-    "num_classes": 4,
+    "num_classes": 2,
+    "classification": "binary (Low vs High fatigue)",
+    "binary_label_map": {
+      "0": 0,
+      "1": 0,
+      "2": 1,
+      "3": 1
+    },
+    "fatigue_thresholds": {
+      "mild_max": 0.25,
+      "moderate_max": 0.5,
+      "high_max": 0.75
+    },
     "epochs": 100,
     "batch_size": 32
   },
@@ -50,7 +62,7 @@
     ]
   },
   "base_model": {
-    "accuracy": 0.5902255639097744,
+    "accuracy": 0.8045112781954887,
     "model_path": "models/base_fatigue_model.h5",
     "tflite_path": "models/fatigue_model.tflite"
   }

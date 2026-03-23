@@ -94,5 +94,17 @@
     "accel_peak",
     "total_steps",
     "cadence_spm"
+  ],
+  "num_classes": 2,
+  "fatigue_thresholds": {
+    "mild_max": 0.25,
+    "moderate_max": 0.5,
+    "high_max": 0.75
+  },
+  "fatigue_level_names": [
+    "Mild",
+    "Moderate",
+    "High",
+    "Critical"
   ]
 }

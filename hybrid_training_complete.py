@@ -442,7 +442,7 @@ def build_base_model(config):
         BatchNormalization(name='bn_2'),
 
         # --- Temporal sequence modeling ---
-        LSTM(config.LSTM_UNITS, name='lstm'),
+        LSTM(config.LSTM_UNITS, unroll=True, name='lstm'),
         Dropout(config.DROPOUT_RATE, name='dropout_1'),
 
         # --- Classification head ---
