@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-03-23 18:42:39",
+  "timestamp": "2026-03-23 22:38:27",
   "config": {
     "seq_length": 5,
     "seq_overlap": 2,
@@ -21,13 +21,13 @@
     "batch_size": 32
   },
   "data": {
-    "total_windows": 4070,
-    "total_sequences": 1326,
+    "total_windows": 8142,
+    "total_sequences": 2652,
     "num_users": 23,
     "num_sessions": 1,
-    "train_sequences": 848,
-    "val_sequences": 212,
-    "test_sequences": 266,
+    "train_sequences": 1696,
+    "val_sequences": 425,
+    "test_sequences": 531,
     "feature_columns": [
       "mean_hr_bpm",
       "hr_std_bpm",
@@ -62,7 +62,34 @@
     ]
   },
   "base_model": {
-    "accuracy": 0.8045112781954887,
+    "accuracy": 0.9510357815442562,
+    "classification_report": {
+      "Low": {
+        "precision": 0.9375,
+        "recall": 0.96,
+        "f1-score": 0.9486166007905138,
+        "support": 250.0
+      },
+      "High": {
+        "precision": 0.9636363636363636,
+        "recall": 0.9430604982206405,
+        "f1-score": 0.9532374100719424,
+        "support": 281.0
+      },
+      "accuracy": 0.9510357815442562,
+      "macro avg": {
+        "precision": 0.9505681818181818,
+        "recall": 0.9515302491103202,
+        "f1-score": 0.9509270054312281,
+        "support": 531.0
+      },
+      "weighted avg": {
+        "precision": 0.9513311076870399,
+        "recall": 0.9510357815442562,
+        "f1-score": 0.9510618878113827,
+        "support": 531.0
+      }
+    },
     "model_path": "models/base_fatigue_model.h5",
     "tflite_path": "models/fatigue_model.tflite"
   }

@@ -545,12 +545,33 @@ class UserPersonalization:
 # MAIN — CLI ENTRY POINT
 # =============================================================================
 
+def personalize_single_user(personalizer, csv_path, user_id):
+    """Run full personalization for one user. Returns results dict or None."""
+    df = load_user_data(csv_path, config)
+
+    if len(df) < config.SEQ_LENGTH:
+        print(f"\nERROR: Only {len(df)} labeled rows. Need at least {config.SEQ_LENGTH}.")
+        return None
+
+    results = personalizer.compare_approaches(df, user_id)
+
+    if results is not None:
+        print(f"\n  Model:   models/user_{user_id}_model.tflite")
+        print(f"  Scaler:  scalers/user_{user_id}_scaler.json")
+
+    return results
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Personalize fatigue model for a user")
-    parser.add_argument('--user_data', type=str, default='features.csv',
-                        help='Path to user\'s features CSV')
-    parser.add_argument('--user_id', type=str, default='user_01',
-                        help='User identifier')
+    parser = argparse.ArgumentParser(description="Personalize fatigue model for one or many users")
+    parser.add_argument('--user_data', type=str, default=None,
+                        help='Path to a single user\'s features CSV')
+    parser.add_argument('--user_id', type=str, default=None,
+                        help='User identifier (single-user mode; auto-read from CSV if omitted)')
+    default_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Testers')
+    parser.add_argument('--user_folder', type=str,
+                        default=default_folder if os.path.isdir(default_folder) else None,
+                        help='Folder containing per-user CSV files (batch mode)')
     parser.add_argument('--base_model', type=str, default=config.BASE_MODEL_PATH,
                         help='Path to base model .h5')
     parser.add_argument('--global_scaler', type=str, default=config.GLOBAL_SCALER_PATH,
@@ -561,30 +582,91 @@ def main():
     print("FITGUARD — USER PERSONALIZATION")
     print("=" * 60)
 
-    # Load user data
-    df = load_user_data(args.user_data, config)
-
-    if len(df) < config.SEQ_LENGTH:
-        print(f"\nERROR: Only {len(df)} labeled rows. Need at least {config.SEQ_LENGTH}.")
-        print("Make sure RPE prompts are being collected during the calibration session.")
-        return
-
-    # Initialize personalizer
     personalizer = UserPersonalization(args.base_model, args.global_scaler)
 
-    # Compare approaches
-    results = personalizer.compare_approaches(df, args.user_id)
+    # ------------------------------------------------------------------
+    # BATCH MODE: process every CSV in a folder
+    # ------------------------------------------------------------------
+    if args.user_folder:
+        folder = args.user_folder
+        csv_files = sorted([
+            f for f in os.listdir(folder) if f.lower().endswith('.csv')
+        ])
+
+        if not csv_files:
+            print(f"\nERROR: No CSV files found in '{folder}'")
+            return
+
+        print(f"\nBatch mode — {len(csv_files)} CSV file(s) found in: {folder}")
+
+        all_results = []
+        failed = []
+
+        for fname in csv_files:
+            csv_path = os.path.join(folder, fname)
+            print(f"\n{'#' * 60}")
+            print(f"Processing: {fname}")
+            print(f"{'#' * 60}")
+
+            try:
+                # Read user_id from inside the CSV
+                df_peek = pd.read_csv(csv_path, nrows=1)
+                if 'user_id' in df_peek.columns:
+                    user_id = str(df_peek['user_id'].iloc[0])
+                else:
+                    # Fall back to filename without extension
+                    user_id = os.path.splitext(fname)[0]
+
+                results = personalize_single_user(personalizer, csv_path, user_id)
+                if results:
+                    all_results.append(results)
+                else:
+                    failed.append((fname, "Not enough data"))
+
+            except Exception as e:
+                print(f"\nERROR processing {fname}: {e}")
+                failed.append((fname, str(e)))
+
+        # Summary
+        print(f"\n{'=' * 60}")
+        print("BATCH SUMMARY")
+        print(f"{'=' * 60}")
+        print(f"  Completed: {len(all_results)}/{len(csv_files)}")
+        for r in all_results:
+            best_acc = r.get(f"accuracy_{r['best_approach']}", 0)
+            print(f"  {r['user_id']}: best={r['best_approach']} ({best_acc:.4f})")
+        if failed:
+            print(f"\n  Failed ({len(failed)}):")
+            for fname, reason in failed:
+                print(f"    {fname}: {reason}")
+        return
+
+    # ------------------------------------------------------------------
+    # SINGLE-USER MODE (original behaviour)
+    # ------------------------------------------------------------------
+    if args.user_data is None:
+        print("\nERROR: No input provided.")
+        print("  Batch mode:       python personalization_workflow.py --user_folder <folder>")
+        print("  Single-user mode: python personalization_workflow.py --user_data <file.csv>")
+        return
+
+    user_data = args.user_data
+    user_id = args.user_id
+
+    # Auto-read user_id from CSV if not provided
+    if user_id is None:
+        df_peek = pd.read_csv(user_data, nrows=1)
+        if 'user_id' in df_peek.columns:
+            user_id = str(df_peek['user_id'].iloc[0])
+        else:
+            user_id = 'user_01'
+
+    results = personalize_single_user(personalizer, user_data, user_id)
 
     if results is None:
         print("\nNot enough data for personalization comparison.")
         return
 
-    # Final output summary
-    print(f"\n{'=' * 60}")
-    print("FILES FOR ANDROID DEPLOYMENT")
-    print(f"{'=' * 60}")
-    print(f"  Model:   models/user_{args.user_id}_model.tflite")
-    print(f"  Scaler:  scalers/user_{args.user_id}_scaler.json")
     print(f"\n  Copy both to app/src/main/assets/ on the Android project.")
     print(f"  The app loads the user scaler JSON to normalize features,")
     print(f"  then feeds sequences of {config.SEQ_LENGTH} windows into the TFLite model.")

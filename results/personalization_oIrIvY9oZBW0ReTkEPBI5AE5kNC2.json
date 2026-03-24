@@ -1,0 +1,9 @@
+{
+  "user_id": "oIrIvY9oZBW0ReTkEPBI5AE5kNC2",
+  "n_windows": 158,
+  "n_sequences": 52,
+  "accuracy_global": 0.5454545454545454,
+  "accuracy_user_norm": 0.45454545454545453,
+  "accuracy_fine_tuned": 0.5454545454545454,
+  "best_approach": "global"
+}

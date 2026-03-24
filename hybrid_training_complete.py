@@ -106,7 +106,7 @@ class Config:
     FINETUNE_LR = 0.0001
 
     # --- File paths ---
-    DATA_PATH = "dataset.csv"
+    DATA_PATH = "augmented_dataset.csv"
     BASE_MODEL_PATH = "models/base_fatigue_model.h5"
     TFLITE_MODEL_PATH = "models/fatigue_model.tflite"
 
@@ -619,12 +619,20 @@ def evaluate_model(model, X_test, y_test, model_name="Model"):
     present_names = [class_names[i] for i in present_classes]
 
     print("\n  Classification Report:")
-    print(classification_report(
+    report_str = classification_report(
         y_true, y_pred,
         labels=present_classes,
         target_names=present_names,
         zero_division=0,
-    ))
+    )
+    report_dict = classification_report(
+        y_true, y_pred,
+        labels=present_classes,
+        target_names=present_names,
+        zero_division=0,
+        output_dict=True,
+    )
+    print(report_str)
 
     cm = confusion_matrix(y_true, y_pred, labels=range(config.NUM_CLASSES))
     print("  Confusion Matrix:")
@@ -664,6 +672,8 @@ def evaluate_model(model, X_test, y_test, model_name="Model"):
         'predictions': y_pred,
         'true_labels': y_true,
         'probabilities': y_pred_probs,
+        'report_str': report_str,
+        'report_dict': report_dict,
     }
 
 
@@ -712,11 +722,6 @@ def export_to_tflite(model_path, output_path):
     model = load_model(model_path)
     converter = tf.lite.TFLiteConverter.from_keras_model(model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    converter.target_spec.supported_ops = [
-        tf.lite.OpsSet.TFLITE_BUILTINS,
-        tf.lite.OpsSet.SELECT_TF_OPS,
-    ]
-    converter._experimental_lower_tensor_list_ops = False
     tflite_model = converter.convert()
 
     with open(output_path, 'wb') as f:
@@ -913,6 +918,7 @@ def main():
         },
         'base_model': {
             'accuracy': float(base_results['accuracy']),
+            'classification_report': base_results['report_dict'],
             'model_path': config.BASE_MODEL_PATH,
             'tflite_path': config.TFLITE_MODEL_PATH,
         },
@@ -937,6 +943,9 @@ def main():
     print(f"\n  Results:")
     print(f"    Base model accuracy: {base_results['accuracy']:.4f} "
           f"({base_results['accuracy'] * 100:.2f}%)")
+    print(f"\n  Classification Report (Base Model):")
+    for line in base_results['report_str'].splitlines():
+        print(f"    {line}")
     print(f"\n  Next steps for Android deployment:")
     print(f"    1. Copy {config.TFLITE_MODEL_PATH} → app/src/main/assets/")
     print(f"    2. Copy scalers/scaler_params.json → app/src/main/assets/")
