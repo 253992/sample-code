@@ -276,8 +276,12 @@ def create_user_scalers(df, config, min_samples=30):
         # Save individual JSON for Android deployment
         params = {
             'user_id': user_id,
+            'feature_names': config.FEATURE_COLUMNS,
             'mean': scaler.mean_.tolist(),
             'std': scaler.scale_.tolist(),
+            'num_classes': config.NUM_CLASSES,
+            'fatigue_thresholds': config.FATIGUE_THRESHOLDS,
+            'fatigue_level_names': ['Mild', 'Moderate', 'High', 'Critical'],
         }
         with open(f'scalers/user_{user_id}_scaler.json', 'w') as f:
             json.dump(params, f, indent=2)
