@@ -751,20 +751,50 @@ def main():
     df, activity_encoder = load_and_preprocess_data(config.DATA_PATH, config)
 
     # -----------------------------------------------------------------
-    # STEP 2: Create scalers
+    # STEP 2: Split users into train / val / test (user-based, no leakage)
     # -----------------------------------------------------------------
-    global_scaler = create_global_scaler(df, config)
-    user_scalers = create_user_scalers(df, config)
+    all_users = df['user_id'].unique()
+    rng = np.random.default_rng(42)
+    shuffled_users = rng.permutation(all_users)
+
+    n = len(shuffled_users)
+    n_test = max(1, round(n * 0.2))
+    n_val  = max(1, round(n * 0.2))
+
+    test_users  = shuffled_users[:n_test]
+    val_users   = shuffled_users[n_test:n_test + n_val]
+    train_users = shuffled_users[n_test + n_val:]
+
+    print(f"\nUser-based split ({n} users total):")
+    print(f"  Train: {len(train_users)} users — {list(train_users)}")
+    print(f"  Val:   {len(val_users)} users — {list(val_users)}")
+    print(f"  Test:  {len(test_users)} users — {list(test_users)}")
+
+    df_train = df[df['user_id'].isin(train_users)].reset_index(drop=True)
+    df_val   = df[df['user_id'].isin(val_users)].reset_index(drop=True)
+    df_test  = df[df['user_id'].isin(test_users)].reset_index(drop=True)
 
     # -----------------------------------------------------------------
-    # STEP 3: Build sequences
+    # STEP 3: Create scalers (fit on training users only)
     # -----------------------------------------------------------------
-    X_seq, y_encoded, y_seq = prepare_training_data(df, config, scaler=global_scaler)
+    global_scaler = create_global_scaler(df_train, config)
+    user_scalers  = create_user_scalers(df_train, config)
 
-    if len(X_seq) < 10:
+    # -----------------------------------------------------------------
+    # STEP 4: Build sequences per split
+    # -----------------------------------------------------------------
+    print("\nBuilding sequences...")
+    X_train, y_train, _ = prepare_training_data(df_train, config, scaler=global_scaler)
+    X_val,   y_val,   _ = prepare_training_data(df_val,   config, scaler=global_scaler)
+    X_test,  y_test,  _ = prepare_training_data(df_test,  config, scaler=global_scaler)
+
+    print(f"  Train:      {len(X_train)} sequences ({len(train_users)} users)")
+    print(f"  Validation: {len(X_val)} sequences ({len(val_users)} users)")
+    print(f"  Test:       {len(X_test)} sequences ({len(test_users)} users)")
+
+    if len(X_train) < 10:
         print("\n" + "!" * 70)
-        print("WARNING: Very few sequences created.")
-        print(f"  You have {len(df)} window summaries → {len(X_seq)} sequences")
+        print("WARNING: Very few training sequences created.")
         print(f"  (SEQ_LENGTH={config.SEQ_LENGTH}, overlap={config.SEQ_OVERLAP})")
         print()
         print("  For meaningful training you need at minimum:")
@@ -775,39 +805,6 @@ def main():
         print("  Current data is useful for verifying the pipeline runs,")
         print("  but the model will not learn meaningful patterns.")
         print("!" * 70)
-
-    # -----------------------------------------------------------------
-    # STEP 4: Split data
-    # -----------------------------------------------------------------
-    print("\nSplitting data...")
-
-    # Check if stratification is possible (need 2+ classes with 2+ samples)
-    unique_labels, label_counts = np.unique(y_seq, return_counts=True)
-    can_stratify = len(unique_labels) > 1 and all(c >= 2 for c in label_counts)
-
-    stratify_arg = y_seq if can_stratify else None
-    if not can_stratify:
-        print("  Cannot stratify — only one class or too few samples per class.")
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_seq, y_encoded,
-        test_size=0.2,
-        random_state=42,
-        stratify=stratify_arg,
-    )
-
-    # Further split train → train + val
-    stratify_train = np.argmax(y_train, axis=1) if can_stratify else None
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train, y_train,
-        test_size=0.2,
-        random_state=42,
-        stratify=stratify_train,
-    )
-
-    print(f"  Train:      {len(X_train)} sequences")
-    print(f"  Validation: {len(X_val)} sequences")
-    print(f"  Test:       {len(X_test)} sequences")
 
     # -----------------------------------------------------------------
     # STEP 5: Compute class weights for imbalanced data
@@ -848,8 +845,8 @@ def main():
     print("PERSONALIZATION DEMO")
     print("=" * 70)
 
-    for user_id in df['user_id'].unique():
-        user_df = df[df['user_id'] == user_id]
+    for user_id in train_users:
+        user_df = df_train[df_train['user_id'] == user_id]
 
         if len(user_df) < config.SEQ_LENGTH + 20:
             print(f"\n  {user_id}: Not enough data for personalization demo "
@@ -912,9 +909,12 @@ def main():
         },
         'data': {
             'total_windows': len(df),
-            'total_sequences': len(X_seq),
+            'total_sequences': len(X_train) + len(X_val) + len(X_test),
             'num_users': df['user_id'].nunique(),
             'num_sessions': df['session_id'].nunique(),
+            'train_users': len(train_users),
+            'val_users': len(val_users),
+            'test_users': len(test_users),
             'train_sequences': len(X_train),
             'val_sequences': len(X_val),
             'test_sequences': len(X_test),
