@@ -2,8 +2,8 @@
   "user_id": "aIxt7rVo8JPl7CKHWwBNghHqDw72",
   "n_windows": 154,
   "n_sequences": 50,
-  "accuracy_global": 0.4,
-  "accuracy_user_norm": 0.7,
+  "accuracy_global": 0.6,
+  "accuracy_user_norm": 0.6,
   "accuracy_fine_tuned": 0.7,
-  "best_approach": "user_norm"
+  "best_approach": "fine_tuned"
 }

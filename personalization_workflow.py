@@ -23,6 +23,8 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow.keras.models import load_model
+from tensorflow.keras.layers import LSTM, Input
+from tensorflow.keras import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.callbacks import EarlyStopping
@@ -201,6 +203,69 @@ def create_sequences_from_segments(df, config, scaler):
         return np.array([]), np.array([])
 
     return np.array(X_sequences), np.array(y_labels)
+
+
+# =============================================================================
+# STATEFUL INFERENCE MODEL
+# =============================================================================
+
+def build_inference_model(trained_model):
+    """
+    Wrap a trained model with explicit LSTM state I/O for session-aware TFLite inference.
+
+    Introspects SEQ_LENGTH, num_features, and LSTM_UNITS directly from the model
+    so this works for both the base model and any fine-tuned user model.
+
+    Android usage:
+      Session start → state_h = zeros(1, LSTM_UNITS), state_c = zeros(1, LSTM_UNITS)
+      Each 5-window batch:
+        [pred, new_h, new_c] = model([sequence, state_h, state_c])
+        state_h, state_c = new_h, new_c
+      New session → reset state_h, state_c to zeros
+
+    Args:
+        trained_model: Trained Sequential Keras model
+
+    Returns:
+        inference_model: Functional Keras model with 3 inputs and 3 outputs
+    """
+    lstm_units = trained_model.get_layer('lstm').units
+    _, seq_len, num_features = trained_model.input_shape
+
+    seq_input  = Input(shape=(seq_len, num_features), name='sequence_input')
+    state_h_in = Input(shape=(lstm_units,), name='state_h')
+    state_c_in = Input(shape=(lstm_units,), name='state_c')
+
+    # Reuse trained CNN + BN layers (weights shared by reference)
+    x = trained_model.get_layer('conv1d_1')(seq_input)
+    x = trained_model.get_layer('bn_1')(x)
+    x = trained_model.get_layer('conv1d_2')(x)
+    x = trained_model.get_layer('bn_2')(x)
+
+    # New LSTM with return_state=True and unroll=True.
+    # unroll=True forces static unrolling (no TensorListReserve ops),
+    # which is required for TFLite conversion. Safe here because SEQ_LENGTH=5 is fixed.
+    lstm_stateful = LSTM(lstm_units, return_state=True, unroll=True, name='lstm_stateful')
+    lstm_out, state_h_out, state_c_out = lstm_stateful(
+        x, initial_state=[state_h_in, state_c_in]
+    )
+
+    # Reuse trained Dense layers (Dropout omitted — off at inference)
+    x = trained_model.get_layer('dense_1')(lstm_out)
+    output = trained_model.get_layer('output')(x)
+
+    inference_model = Model(
+        inputs=[seq_input, state_h_in, state_c_in],
+        outputs=[output, state_h_out, state_c_out],
+        name='fatigue_inference_stateful',
+    )
+
+    # Transfer LSTM weights from the trained model
+    inference_model.get_layer('lstm_stateful').set_weights(
+        trained_model.get_layer('lstm').get_weights()
+    )
+
+    return inference_model
 
 
 # =============================================================================
@@ -525,12 +590,14 @@ class UserPersonalization:
     # -----------------------------------------------------------------
 
     def _export_user_tflite(self, user_id):
-        """Convert user's fine-tuned model to TFLite for Android."""
+        """Convert user's fine-tuned model to TFLite with stateful LSTM for Android."""
         model_path = f'models/user_{user_id}_model.h5'
         tflite_path = f'models/user_{user_id}_model.tflite'
 
-        model = load_model(model_path)
-        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        trained_model = load_model(model_path)
+        inference_model = build_inference_model(trained_model)
+
+        converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
         tflite_model = converter.convert()
 

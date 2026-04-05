@@ -467,6 +467,68 @@ def build_base_model(config):
     return model
 
 
+def build_inference_model(trained_model, config):
+    """
+    Wrap a trained model with explicit LSTM state I/O for session-aware TFLite inference.
+
+    The training model is stateless — each call sees only the current 5-window
+    sequence. This wrapper exposes the LSTM hidden and cell states so the Android
+    app can carry them across the entire exercise session, giving the LSTM true
+    memory from window 1 through the end of the session.
+
+    Android usage:
+      Session start → state_h = zeros(1, LSTM_UNITS), state_c = zeros(1, LSTM_UNITS)
+      Each 5-window batch:
+        [pred, new_h, new_c] = model([sequence, state_h, state_c])
+        state_h, state_c = new_h, new_c
+      New session → reset state_h, state_c to zeros
+
+    Args:
+        trained_model: Trained Sequential Keras model (base or fine-tuned)
+        config: Configuration object
+
+    Returns:
+        inference_model: Functional Keras model with 3 inputs and 3 outputs
+    """
+    num_features = len(config.FEATURE_COLUMNS)
+    lstm_units = trained_model.get_layer('lstm').units
+
+    seq_input  = Input(shape=(config.SEQ_LENGTH, num_features), name='sequence_input')
+    state_h_in = Input(shape=(lstm_units,), name='state_h')
+    state_c_in = Input(shape=(lstm_units,), name='state_c')
+
+    # Reuse the trained CNN + BN layers (weights shared by reference, no copy)
+    x = trained_model.get_layer('conv1d_1')(seq_input)
+    x = trained_model.get_layer('bn_1')(x)
+    x = trained_model.get_layer('conv1d_2')(x)
+    x = trained_model.get_layer('bn_2')(x)
+
+    # New LSTM with return_state=True and unroll=True.
+    # unroll=True forces static unrolling (no TensorListReserve ops),
+    # which is required for TFLite conversion. Safe here because SEQ_LENGTH=5 is fixed.
+    lstm_stateful = LSTM(lstm_units, return_state=True, unroll=True, name='lstm_stateful')
+    lstm_out, state_h_out, state_c_out = lstm_stateful(
+        x, initial_state=[state_h_in, state_c_in]
+    )
+
+    # Reuse trained Dense layers (Dropout omitted — always off at inference)
+    x = trained_model.get_layer('dense_1')(lstm_out)
+    output = trained_model.get_layer('output')(x)
+
+    inference_model = Model(
+        inputs=[seq_input, state_h_in, state_c_in],
+        outputs=[output, state_h_out, state_c_out],
+        name='fatigue_inference_stateful',
+    )
+
+    # Transfer LSTM weights from the trained model
+    inference_model.get_layer('lstm_stateful').set_weights(
+        trained_model.get_layer('lstm').get_weights()
+    )
+
+    return inference_model
+
+
 # =============================================================================
 # TRAINING
 # =============================================================================
@@ -715,6 +777,19 @@ def export_to_tflite(model_path, output_path):
     """
     Convert Keras model to TensorFlow Lite for Android deployment.
 
+    Wraps the model in a stateful inference shell that exposes LSTM state as
+    explicit inputs/outputs so the Android app can accumulate session memory.
+
+    TFLite inputs:
+      sequence_input  shape (SEQ_LENGTH, num_features)
+      state_h         shape (LSTM_UNITS,)   — hidden state, zeros at session start
+      state_c         shape (LSTM_UNITS,)   — cell state, zeros at session start
+
+    TFLite outputs:
+      output          shape (NUM_CLASSES,)  — fatigue probabilities
+      state_h_out     shape (LSTM_UNITS,)   — pass back as state_h next call
+      state_c_out     shape (LSTM_UNITS,)   — pass back as state_c next call
+
     Args:
         model_path: Path to .h5 model
         output_path: Path for .tflite output
@@ -723,16 +798,24 @@ def export_to_tflite(model_path, output_path):
     print("CONVERTING TO TENSORFLOW LITE")
     print("=" * 70)
 
-    model = load_model(model_path)
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    trained_model = load_model(model_path)
+    inference_model = build_inference_model(trained_model, config)
+
+    converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     tflite_model = converter.convert()
 
     with open(output_path, 'wb') as f:
         f.write(tflite_model)
 
+    lstm_units = trained_model.get_layer('lstm').units
     size_kb = len(tflite_model) / 1024
     print(f"  Saved: {output_path} ({size_kb:.1f} KB)")
+    print(f"  Inputs:  sequence_input ({config.SEQ_LENGTH}, {len(config.FEATURE_COLUMNS)}), "
+          f"state_h ({lstm_units},), state_c ({lstm_units},)")
+    print(f"  Outputs: output ({config.NUM_CLASSES},), "
+          f"state_h_out ({lstm_units},), state_c_out ({lstm_units},)")
+    print(f"  Android: reset state_h/c to zeros at the start of each session.")
 
 
 # =============================================================================
