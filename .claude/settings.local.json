@@ -5,7 +5,10 @@
       "Bash(cd \"C:\\\\Users\\\\LENOVO\\\\Documents\\\\THESIS\\\\sample code\" && python -m py_compile personalization_workflow.py 2>&1)",
       "Bash(cd \"C:\\\\Users\\\\LENOVO\\\\Documents\\\\THESIS\\\\sample code\" && python -c \"import pandas as pd; df = pd.read_csv\\('features.csv'\\); print\\('Missing fatigue_level:', df['fatigue_level'].isna\\(\\).sum\\(\\), 'out of', len\\(df\\)\\); print\\('Unique fatigue_level:', df['fatigue_level'].unique\\(\\)\\)\" 2>&1)",
       "Bash(head:*)",
-      "Bash(cd \"C:\\\\Users\\\\LENOVO\\\\Documents\\\\THESIS\\\\sample code\" && python -c \"try:\n    from keras.models import Sequential\n    print\\('keras import works \\(legacy compatibility\\)'\\)\nexcept ImportError as e:\n    print\\('keras import failed:', e\\)\" 2>&1)"
+      "Bash(cd \"C:\\\\Users\\\\LENOVO\\\\Documents\\\\THESIS\\\\sample code\" && python -c \"try:\n    from keras.models import Sequential\n    print\\('keras import works \\(legacy compatibility\\)'\\)\nexcept ImportError as e:\n    print\\('keras import failed:', e\\)\" 2>&1)",
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('hybrid_training_complete.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python:*)"
     ]
   }
 }

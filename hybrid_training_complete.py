@@ -1,15 +1,7 @@
 """
-HYBRID FATIGUE PREDICTION MODEL - COMPLETE TRAINING CODE
-========================================================
+FITGUARD HYBRID FATIGUE PREDICTION MODEL
 
-This script includes:
-1. Base model training (on all participants)
-2. User-specific normalization
-3. Fine-tuning capability
-4. Model export for Android deployment
-
-Author: Your Name
-Date: 2026
+MONTERO, VILLALON, VINLUAN 2026
 """
 
 import numpy as np
@@ -69,7 +61,11 @@ class Config:
                                # P(High) >= 0.75 → Critical (level 3)
     }
 
-    # --- Feature columns (33 model inputs) ---
+    # --- Feature columns (19 PPG-only inputs) ---
+    # Accelerometer and activity features removed: session analysis showed
+    # accel_mag_var and cadence_spm are severe outliers (Z = -2.78 / -2.65)
+    # between training data and real app sessions, causing erratic predictions.
+    # HR, HRV, and SpO2 features are stable across sessions (all within ±1.2σ).
     FEATURE_COLUMNS = [
         # Heart Rate (7)
         "mean_hr_bpm", "hr_std_bpm", "hr_min_bpm", "hr_max_bpm",
@@ -80,14 +76,6 @@ class Config:
         "lf_power_ms2", "hf_power_ms2", "lf_hf_ratio", "total_power_ms2",
         # SpO2 (3)
         "spo2_mean_pct", "spo2_min_pct", "spo2_std_pct",
-        # Accelerometer (9)
-        "accel_x_mean", "accel_y_mean", "accel_z_mean",
-        "accel_x_var", "accel_y_var", "accel_z_var",
-        "accel_mag_mean", "accel_mag_var", "accel_peak",
-        # Skin Temperature (3)
-        #"skin_temp_obj", "skin_temp_delta", "skin_temp_ambient",
-        # Activity Context (2)
-        "total_steps", "cadence_spm",
     ]
 
     # --- Model architecture ---
@@ -312,7 +300,8 @@ def create_sequences(df, config, scaler):
 
     Returns:
         X_seq: np.array of shape (num_sequences, SEQ_LENGTH, num_features)
-        y_seq: np.array of integer fatigue labels
+        y_seq: np.array of integer current fatigue labels
+        y_future_seq: np.array of integer future fatigue labels (next window)
     """
     print("\nConstructing sequences...")
 
@@ -322,6 +311,7 @@ def create_sequences(df, config, scaler):
 
     X_sequences = []
     y_labels = []
+    y_future_labels = []
 
     # Group by user + session + segment to avoid crossing boundaries
     groups = df.groupby(['user_id', 'session_segment'])
@@ -339,20 +329,27 @@ def create_sequences(df, config, scaler):
 
             X_sequences.append(seq_features)
 
-            # Label strategy: use the LAST window's fatigue level.
-            # This makes the model predict "what fatigue level is the
-            # user at by the end of this sequence?"
-            # Alternative: np.max(seq_labels) for escalation detection.
+            # Current label: fatigue level at the END of this sequence.
             y_labels.append(seq_labels[-1])
+
+            # Future label: fatigue level of the NEXT window after this sequence.
+            # If we are at the end of the session, repeat the current label
+            # (fatigue is assumed to hold steady when no future data exists).
+            if i + seq_len < len(y_raw):
+                y_future_labels.append(y_raw[i + seq_len])
+            else:
+                y_future_labels.append(seq_labels[-1])
 
     X_seq = np.array(X_sequences)
     y_seq = np.array(y_labels)
+    y_future_seq = np.array(y_future_labels)
 
     print(f"  Sequences: {len(X_seq)}")
     print(f"  Shape: {X_seq.shape} → (samples, {seq_len} windows, {num_features} features)")
-    print(f"  Label distribution: {dict(zip(*np.unique(y_seq, return_counts=True)))}")
+    print(f"  Current label distribution:  {dict(zip(*np.unique(y_seq, return_counts=True)))}")
+    print(f"  Future label distribution:   {dict(zip(*np.unique(y_future_seq, return_counts=True)))}")
 
-    return X_seq, y_seq
+    return X_seq, y_seq, y_future_seq
 
 
 def prepare_training_data(df, config, scaler=None, user_id=None):
@@ -367,8 +364,10 @@ def prepare_training_data(df, config, scaler=None, user_id=None):
 
     Returns:
         X_seq: Prepared sequences
-        y_encoded: One-hot encoded labels
-        y_seq: Original integer labels (for stratification)
+        y_encoded: One-hot encoded current labels
+        y_seq: Original integer current labels (for stratification)
+        y_future_encoded: One-hot encoded future labels
+        y_future_seq: Original integer future labels
     """
     print("\nPreparing training data...")
 
@@ -387,10 +386,11 @@ def prepare_training_data(df, config, scaler=None, user_id=None):
         else:
             print(f"  Using scaler for user {user_id}")
 
-    X_seq, y_seq = create_sequences(df, config, scaler)
+    X_seq, y_seq, y_future_seq = create_sequences(df, config, scaler)
     y_encoded = to_categorical(y_seq, num_classes=config.NUM_CLASSES)
+    y_future_encoded = to_categorical(y_future_seq, num_classes=config.NUM_CLASSES)
 
-    return X_seq, y_encoded, y_seq
+    return X_seq, y_encoded, y_seq, y_future_encoded, y_future_seq
 
 
 # =============================================================================
@@ -399,66 +399,99 @@ def prepare_training_data(df, config, scaler=None, user_id=None):
 
 def build_base_model(config):
     """
-    Build the CNN-LSTM hybrid model for fatigue prediction.
+    Build the CNN-LSTM hybrid model for fatigue classification + forecasting.
 
     Input shape: (SEQ_LENGTH, num_features)
       - SEQ_LENGTH consecutive window summaries
       - Each window has num_features pre-computed physiological metrics
 
     Architecture:
-      Conv1D → BN → Conv1D → BN → LSTM → Dense → Softmax
+      Conv1D → BN → Conv1D → BN → LSTM → Dense(shared)
+                                              │            │
+                                       current_fatigue  future_fatigue
+                                       (what is now)    (what comes next)
 
-    Conv1D slides across the temporal axis (consecutive windows),
-    learning local patterns like "HR rising while HRV drops over
-    3 consecutive windows". LSTM then captures longer-range
-    progression across the full sequence.
+    The shared backbone (Conv1D + LSTM) learns temporal patterns useful for
+    both classifying the current state and forecasting the next one.
+    Two separate Dense output heads are trained simultaneously:
+      - current_fatigue: P(High) at the end of the input sequence
+      - future_fatigue:  P(High) at the next window (~48-69 s ahead)
+
+    The future head uses half the loss weight of the current head because
+    forecasting is inherently noisier than classifying an observed state.
 
     Args:
         config: Configuration object
 
     Returns:
-        model: Compiled Keras model
+        model: Compiled Keras model (two outputs)
     """
     print("\nBuilding base model...")
 
     num_features = len(config.FEATURE_COLUMNS)
 
-    model = Sequential([
-        # --- Temporal feature extraction ---
-        # Conv1D kernel slides across consecutive windows
-        Conv1D(
-            config.CONV_FILTERS,
-            kernel_size=3,
-            activation='relu',
-            padding='same',
-            input_shape=(config.SEQ_LENGTH, num_features),
-            name='conv1d_1'
-        ),
-        BatchNormalization(name='bn_1'),
+    # --- Input ---
+    inputs = Input(shape=(config.SEQ_LENGTH, num_features), name='input')
 
-        Conv1D(
-            config.CONV_FILTERS * 2,
-            kernel_size=3,
-            activation='relu',
-            padding='same',
-            name='conv1d_2'
-        ),
-        BatchNormalization(name='bn_2'),
+    # --- Temporal feature extraction ---
+    # Conv1D kernel slides across consecutive windows, learning local
+    # patterns like "HR rising while HRV drops over 3 windows".
+    x = Conv1D(
+        config.CONV_FILTERS,
+        kernel_size=3,
+        activation='relu',
+        padding='same',
+        name='conv1d_1'
+    )(inputs)
+    x = BatchNormalization(name='bn_1')(x)
 
-        # --- Temporal sequence modeling ---
-        LSTM(config.LSTM_UNITS, unroll=True, name='lstm'),
-        Dropout(config.DROPOUT_RATE, name='dropout_1'),
+    x = Conv1D(
+        config.CONV_FILTERS * 2,
+        kernel_size=3,
+        activation='relu',
+        padding='same',
+        name='conv1d_2'
+    )(x)
+    x = BatchNormalization(name='bn_2')(x)
 
-        # --- Classification head ---
-        Dense(config.DENSE_UNITS, activation='relu', name='dense_1'),
-        Dropout(config.DROPOUT_RATE / 2, name='dropout_2'),
-        Dense(config.NUM_CLASSES, activation='softmax', name='output'),
-    ])
+    # --- Temporal sequence modeling ---
+    # LSTM captures longer-range progression across the full sequence.
+    x = LSTM(config.LSTM_UNITS, unroll=True, name='lstm')(x)
+    x = Dropout(config.DROPOUT_RATE, name='dropout_1')(x)
+
+    # --- Shared representation ---
+    # Both output heads branch from this shared dense layer so the
+    # backbone is forced to encode the fatigue trajectory, not just
+    # the current state.
+    shared = Dense(config.DENSE_UNITS, activation='relu', name='dense_shared')(x)
+    shared = Dropout(config.DROPOUT_RATE / 2, name='dropout_shared')(shared)
+
+    # --- Output heads ---
+    current_out = Dense(
+        config.NUM_CLASSES, activation='softmax', name='current_fatigue'
+    )(shared)
+    future_out = Dense(
+        config.NUM_CLASSES, activation='softmax', name='future_fatigue'
+    )(shared)
+
+    model = Model(inputs=inputs, outputs=[current_out, future_out])
 
     model.compile(
         optimizer=Adam(learning_rate=config.LEARNING_RATE),
-        loss='categorical_crossentropy',
-        metrics=['accuracy'],
+        loss={
+            'current_fatigue': 'categorical_crossentropy',
+            'future_fatigue':  'categorical_crossentropy',
+        },
+        # Future prediction is noisier so it contributes less to the
+        # total loss — keeps the backbone optimised for current accuracy.
+        loss_weights={
+            'current_fatigue': 1.0,
+            'future_fatigue':  0.5,
+        },
+        metrics={
+            'current_fatigue': 'accuracy',
+            'future_fatigue':  'accuracy',
+        },
     )
 
     print("  Model built successfully")
@@ -471,13 +504,17 @@ def build_base_model(config):
 # TRAINING
 # =============================================================================
 
-def train_base_model(X_train, y_train, X_val, y_val, config, class_weights=None):
+def train_base_model(X_train, y_train, y_future_train,
+                     X_val, y_val, y_future_val,
+                     config, class_weights=None):
     """
     Train the base model on all users' data.
 
     Args:
-        X_train, y_train: Training data
-        X_val, y_val: Validation data
+        X_train, y_train: Training features and current labels
+        y_future_train: One-hot future labels for training
+        X_val, y_val: Validation features and current labels
+        y_future_val: One-hot future labels for validation
         config: Configuration object
         class_weights: Optional dict for imbalanced classes
 
@@ -491,6 +528,53 @@ def train_base_model(X_train, y_train, X_val, y_val, config, class_weights=None)
 
     model = build_base_model(config)
 
+    # Keras 3 does not support class_weight or sample_weight for multi-output
+    # models — compile_utils.py resolves weights by positional index and raises
+    # KeyError: 0 when the structure doesn't match.
+    #
+    # Workaround: embed sample weights directly in a tf.data.Dataset as the
+    # third element of each (x, y, w) tuple.  Keras reads the weight from the
+    # dataset without going through compile_utils path resolution.
+    if class_weights is not None:
+        train_class_indices = np.argmax(y_train, axis=1)
+        sw_train = np.array([class_weights[i] for i in train_class_indices],
+                            dtype=np.float32)
+        train_ds = (
+            tf.data.Dataset
+            .from_tensor_slices((
+                X_train.astype(np.float32),
+                {'current_fatigue': y_train.astype(np.float32),
+                 'future_fatigue':  y_future_train.astype(np.float32)},
+                sw_train,
+            ))
+            .shuffle(buffer_size=len(X_train))
+            .batch(config.BATCH_SIZE)
+            .prefetch(tf.data.AUTOTUNE)
+        )
+    else:
+        train_ds = (
+            tf.data.Dataset
+            .from_tensor_slices((
+                X_train.astype(np.float32),
+                {'current_fatigue': y_train.astype(np.float32),
+                 'future_fatigue':  y_future_train.astype(np.float32)},
+            ))
+            .shuffle(buffer_size=len(X_train))
+            .batch(config.BATCH_SIZE)
+            .prefetch(tf.data.AUTOTUNE)
+        )
+
+    val_ds = (
+        tf.data.Dataset
+        .from_tensor_slices((
+            X_val.astype(np.float32),
+            {'current_fatigue': y_val.astype(np.float32),
+             'future_fatigue':  y_future_val.astype(np.float32)},
+        ))
+        .batch(config.BATCH_SIZE)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
     callbacks = [
         EarlyStopping(
             monitor='val_loss',
@@ -500,7 +584,8 @@ def train_base_model(X_train, y_train, X_val, y_val, config, class_weights=None)
         ),
         ModelCheckpoint(
             config.BASE_MODEL_PATH,
-            monitor='val_accuracy',
+            monitor='val_current_fatigue_accuracy',
+            mode='max',
             save_best_only=True,
             verbose=1,
         ),
@@ -515,12 +600,10 @@ def train_base_model(X_train, y_train, X_val, y_val, config, class_weights=None)
 
     print(f"\nTraining for up to {config.EPOCHS} epochs...")
     history = model.fit(
-        X_train, y_train,
+        train_ds,
         epochs=config.EPOCHS,
-        batch_size=config.BATCH_SIZE,
-        validation_data=(X_val, y_val),
+        validation_data=val_ds,
         callbacks=callbacks,
-        class_weight=class_weights,
         verbose=1,
     )
 
@@ -528,17 +611,19 @@ def train_base_model(X_train, y_train, X_val, y_val, config, class_weights=None)
     return model, history
 
 
-def fine_tune_for_user(base_model_path, user_X, user_y, user_id, config):
+def fine_tune_for_user(base_model_path, user_X, user_y, user_y_future, user_id, config):
     """
     Fine-tune the base model for a specific user.
 
-    Freezes early layers and retrains only the classification head
-    with a low learning rate on the user's personal data.
+    Freezes the shared backbone (Conv1D + LSTM) and retrains only the
+    shared dense layer and both output heads with a low learning rate
+    on the user's personal data.
 
     Args:
         base_model_path: Path to trained base model
         user_X: User's feature sequences (normalized)
-        user_y: User's one-hot labels
+        user_y: User's one-hot current labels
+        user_y_future: User's one-hot future labels
         user_id: User identifier
         config: Configuration object
 
@@ -552,34 +637,56 @@ def fine_tune_for_user(base_model_path, user_X, user_y, user_id, config):
 
     model = load_model(base_model_path)
 
-    # Freeze everything except the last 3 layers (dense_1, dropout_2, output)
-    for layer in model.layers[:-3]:
+    # Freeze backbone layers (input, conv1d_1, bn_1, conv1d_2, bn_2, lstm,
+    # dropout_1). Keep dense_shared, dropout_shared, current_fatigue,
+    # future_fatigue trainable (last 4 layers).
+    for layer in model.layers[:-4]:
         layer.trainable = False
 
     model.compile(
         optimizer=Adam(learning_rate=config.FINETUNE_LR),
-        loss='categorical_crossentropy',
-        metrics=['accuracy'],
+        loss={
+            'current_fatigue': 'categorical_crossentropy',
+            'future_fatigue':  'categorical_crossentropy',
+        },
+        loss_weights={
+            'current_fatigue': 1.0,
+            'future_fatigue':  0.5,
+        },
+        metrics={
+            'current_fatigue': 'accuracy',
+            'future_fatigue':  'accuracy',
+        },
     )
 
     trainable = sum(1 for l in model.layers if l.trainable)
     print(f"  Trainable layers: {trainable}/{len(model.layers)}")
 
-    X_train, X_val, y_train, y_val = train_test_split(
-        user_X, user_y, test_size=0.2, random_state=42,
+    X_train, X_val, y_train, y_val, yf_train, yf_val = train_test_split(
+        user_X, user_y, user_y_future, test_size=0.2, random_state=42,
     )
 
     user_model_path = f'models/user_{user_id}_model.h5'
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
-        ModelCheckpoint(user_model_path, monitor='val_accuracy', save_best_only=True, verbose=1),
+        ModelCheckpoint(
+            user_model_path,
+            monitor='val_current_fatigue_accuracy',
+            mode='max',
+            save_best_only=True,
+            verbose=1,
+        ),
     ]
 
     history = model.fit(
-        X_train, y_train,
+        X_train,
+        {'current_fatigue': y_train, 'future_fatigue': yf_train},
         epochs=config.FINETUNE_EPOCHS,
         batch_size=16,
-        validation_data=(X_val, y_val),
+        validation_data=(
+            X_val,
+            {'current_fatigue': y_val, 'future_fatigue': yf_val},
+        ),
         callbacks=callbacks,
         verbose=1,
     )
@@ -592,14 +699,15 @@ def fine_tune_for_user(base_model_path, user_X, user_y, user_id, config):
 # EVALUATION
 # =============================================================================
 
-def evaluate_model(model, X_test, y_test, model_name="Model"):
+def evaluate_model(model, X_test, y_test, y_future_test, model_name="Model"):
     """
-    Evaluate model and generate reports.
+    Evaluate model and generate reports for both output heads.
 
     Args:
-        model: Trained model
+        model: Trained model (two outputs: current_fatigue, future_fatigue)
         X_test: Test features
-        y_test: Test labels (one-hot)
+        y_test: One-hot current labels
+        y_future_test: One-hot future labels
         model_name: Label for reports
 
     Returns:
@@ -609,97 +717,162 @@ def evaluate_model(model, X_test, y_test, model_name="Model"):
     print(f"EVALUATING: {model_name.upper()}")
     print(f"{'=' * 70}")
 
-    y_pred_probs = model.predict(X_test, verbose=0)
-    y_pred = np.argmax(y_pred_probs, axis=1)
-    y_true = np.argmax(y_test, axis=1)
+    # Model returns [current_probs, future_probs]
+    outputs = model.predict(X_test, verbose=0)
+    y_pred_probs_current = outputs[0]
+    y_pred_probs_future  = outputs[1]
 
-    accuracy = accuracy_score(y_true, y_pred)
-    print(f"\n  Accuracy: {accuracy:.4f} ({accuracy * 100:.2f}%)")
+    y_pred_current = np.argmax(y_pred_probs_current, axis=1)
+    y_pred_future  = np.argmax(y_pred_probs_future,  axis=1)
+    y_true_current = np.argmax(y_test,        axis=1)
+    y_true_future  = np.argmax(y_future_test, axis=1)
+
+    acc_current = accuracy_score(y_true_current, y_pred_current)
+    acc_future  = accuracy_score(y_true_future,  y_pred_future)
+    print(f"\n  Current fatigue accuracy: {acc_current:.4f} ({acc_current * 100:.2f}%)")
+    print(f"  Future  fatigue accuracy: {acc_future:.4f}  ({acc_future  * 100:.2f}%)")
 
     class_names = ["Low", "High"]
 
-    # Only report on classes that appear in the data
-    present_classes = sorted(set(y_true) | set(y_pred))
-    present_names = [class_names[i] for i in present_classes]
-
-    print("\n  Classification Report:")
-    report_str = classification_report(
-        y_true, y_pred,
-        labels=present_classes,
-        target_names=present_names,
-        zero_division=0,
+    # --- Current head report ---
+    present_current = sorted(set(y_true_current) | set(y_pred_current))
+    present_names_c = [class_names[i] for i in present_current]
+    print("\n  [Current] Classification Report:")
+    report_str_current = classification_report(
+        y_true_current, y_pred_current,
+        labels=present_current, target_names=present_names_c, zero_division=0,
     )
-    report_dict = classification_report(
-        y_true, y_pred,
-        labels=present_classes,
-        target_names=present_names,
-        zero_division=0,
-        output_dict=True,
+    report_dict_current = classification_report(
+        y_true_current, y_pred_current,
+        labels=present_current, target_names=present_names_c,
+        zero_division=0, output_dict=True,
     )
-    print(report_str)
+    print(report_str_current)
 
-    cm = confusion_matrix(y_true, y_pred, labels=range(config.NUM_CLASSES))
-    print("  Confusion Matrix:")
-    print(cm)
+    cm_current = confusion_matrix(y_true_current, y_pred_current, labels=range(config.NUM_CLASSES))
+    print("  [Current] Confusion Matrix:")
+    print(cm_current)
 
-    # Plot confusion matrix
+    safe_name = model_name.lower().replace(" ", "_")
+
     plt.figure(figsize=(6, 5))
     sns.heatmap(
-        cm, annot=True, fmt='d', cmap='Blues',
+        cm_current, annot=True, fmt='d', cmap='Blues',
         xticklabels=class_names, yticklabels=class_names,
     )
-    plt.title(f'Confusion Matrix — {model_name}')
+    plt.title(f'Current Fatigue — {model_name}')
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
     plt.tight_layout()
-    safe_name = model_name.lower().replace(" ", "_")
-    plt.savefig(f'results/{safe_name}_confusion_matrix.png')
+    plt.savefig(f'results/{safe_name}_current_confusion_matrix.png')
     plt.close()
 
-    # Show 4-level fatigue distribution from P(High) probabilities
-    if y_pred_probs.shape[1] == 2:
-        p_high = y_pred_probs[:, 1]
-        thresholds = config.FATIGUE_THRESHOLDS
-        fatigue_4class = np.where(
-            p_high < thresholds['mild_max'], 0,
-            np.where(p_high < thresholds['moderate_max'], 1,
-                     np.where(p_high < thresholds['high_max'], 2, 3)))
-        fatigue_names = ["Mild", "Moderate", "High", "Critical"]
-        unique_4, counts_4 = np.unique(fatigue_4class, return_counts=True)
-        print(f"\n  4-Level Fatigue Distribution (from P(High) thresholds):")
-        for u, c in zip(unique_4, counts_4):
-            print(f"    {fatigue_names[u]:>10s}: {c:>4d} ({c / len(fatigue_4class) * 100:.1f}%)")
-        print(f"  P(High) stats: mean={p_high.mean():.3f}, min={p_high.min():.3f}, max={p_high.max():.3f}")
+    # --- Future head report ---
+    present_future = sorted(set(y_true_future) | set(y_pred_future))
+    present_names_f = [class_names[i] for i in present_future]
+    print("\n  [Future] Classification Report:")
+    report_str_future = classification_report(
+        y_true_future, y_pred_future,
+        labels=present_future, target_names=present_names_f, zero_division=0,
+    )
+    report_dict_future = classification_report(
+        y_true_future, y_pred_future,
+        labels=present_future, target_names=present_names_f,
+        zero_division=0, output_dict=True,
+    )
+    print(report_str_future)
+
+    cm_future = confusion_matrix(y_true_future, y_pred_future, labels=range(config.NUM_CLASSES))
+    print("  [Future] Confusion Matrix:")
+    print(cm_future)
+
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(
+        cm_future, annot=True, fmt='d', cmap='Oranges',
+        xticklabels=class_names, yticklabels=class_names,
+    )
+    plt.title(f'Future Fatigue — {model_name}')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    plt.savefig(f'results/{safe_name}_future_confusion_matrix.png')
+    plt.close()
+
+    # --- Trend transition summary ---
+    # Shows how often the model predicts each current→future combination,
+    # giving a picture of the trend insights the app will display.
+    fatigue_names = ["Mild", "Moderate", "High", "Critical"]
+    thresholds = config.FATIGUE_THRESHOLDS
+
+    def to_4level(p_high_arr):
+        return np.where(
+            p_high_arr < thresholds['mild_max'], 0,
+            np.where(p_high_arr < thresholds['moderate_max'], 1,
+                     np.where(p_high_arr < thresholds['high_max'], 2, 3)))
+
+    p_high_current = y_pred_probs_current[:, 1]
+    p_high_future  = y_pred_probs_future[:, 1]
+    level_current  = to_4level(p_high_current)
+    level_future   = to_4level(p_high_future)
+
+    print(f"\n  Trend Transition Distribution (predicted current → predicted future):")
+    for cur in range(4):
+        for fut in range(4):
+            count = np.sum((level_current == cur) & (level_future == fut))
+            if count > 0:
+                arrow = "→" if cur == fut else ("↑" if fut > cur else "↓")
+                print(f"    {fatigue_names[cur]:>10s} {arrow} {fatigue_names[fut]:<10s}: {count:>4d}")
+
+    print(f"\n  P(High) current: mean={p_high_current.mean():.3f}  "
+          f"P(High) future: mean={p_high_future.mean():.3f}")
 
     return {
-        'accuracy': accuracy,
-        'predictions': y_pred,
-        'true_labels': y_true,
-        'probabilities': y_pred_probs,
-        'report_str': report_str,
-        'report_dict': report_dict,
+        'accuracy': acc_current,
+        'future_accuracy': acc_future,
+        'predictions': y_pred_current,
+        'future_predictions': y_pred_future,
+        'true_labels': y_true_current,
+        'true_future_labels': y_true_future,
+        'probabilities': y_pred_probs_current,
+        'future_probabilities': y_pred_probs_future,
+        'report_str': report_str_current,
+        'report_dict': report_dict_current,
+        'future_report_str': report_str_future,
+        'future_report_dict': report_dict_future,
     }
 
 
 def plot_training_history(history, title="Training History"):
-    """Plot training and validation accuracy/loss curves."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    """Plot training and validation accuracy/loss curves for both output heads."""
+    h = history.history
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    ax1.plot(history.history['accuracy'], label='Train')
-    ax1.plot(history.history['val_accuracy'], label='Validation')
-    ax1.set_title(f'{title} — Accuracy')
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Accuracy')
-    ax1.legend()
-    ax1.grid(True)
+    # Current fatigue accuracy
+    axes[0].plot(h['current_fatigue_accuracy'], label='Train')
+    axes[0].plot(h['val_current_fatigue_accuracy'], label='Validation')
+    axes[0].set_title(f'{title} — Current Accuracy')
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Accuracy')
+    axes[0].legend()
+    axes[0].grid(True)
 
-    ax2.plot(history.history['loss'], label='Train')
-    ax2.plot(history.history['val_loss'], label='Validation')
-    ax2.set_title(f'{title} — Loss')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Loss')
-    ax2.legend()
-    ax2.grid(True)
+    # Future fatigue accuracy
+    axes[1].plot(h['future_fatigue_accuracy'], label='Train')
+    axes[1].plot(h['val_future_fatigue_accuracy'], label='Validation')
+    axes[1].set_title(f'{title} — Future Accuracy')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Accuracy')
+    axes[1].legend()
+    axes[1].grid(True)
+
+    # Total loss
+    axes[2].plot(h['loss'], label='Train')
+    axes[2].plot(h['val_loss'], label='Validation')
+    axes[2].set_title(f'{title} — Total Loss')
+    axes[2].set_xlabel('Epoch')
+    axes[2].set_ylabel('Loss')
+    axes[2].legend()
+    axes[2].grid(True)
 
     plt.tight_layout()
     safe_name = title.lower().replace(" ", "_")
@@ -757,9 +930,11 @@ def main():
     user_scalers = create_user_scalers(df, config)
 
     # -----------------------------------------------------------------
-    # STEP 3: Build sequences
+    # STEP 3: Build sequences (current + future labels)
     # -----------------------------------------------------------------
-    X_seq, y_encoded, y_seq = prepare_training_data(df, config, scaler=global_scaler)
+    X_seq, y_encoded, y_seq, y_future_encoded, y_future_seq = prepare_training_data(
+        df, config, scaler=global_scaler
+    )
 
     if len(X_seq) < 10:
         print("\n" + "!" * 70)
@@ -777,7 +952,7 @@ def main():
         print("!" * 70)
 
     # -----------------------------------------------------------------
-    # STEP 4: Split data
+    # STEP 4: Split data (current and future labels split together)
     # -----------------------------------------------------------------
     print("\nSplitting data...")
 
@@ -789,8 +964,8 @@ def main():
     if not can_stratify:
         print("  Cannot stratify — only one class or too few samples per class.")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_seq, y_encoded,
+    X_train, X_test, y_train, y_test, yf_train, yf_test = train_test_split(
+        X_seq, y_encoded, y_future_encoded,
         test_size=0.2,
         random_state=42,
         stratify=stratify_arg,
@@ -798,8 +973,8 @@ def main():
 
     # Further split train → train + val
     stratify_train = np.argmax(y_train, axis=1) if can_stratify else None
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train, y_train,
+    X_train, X_val, y_train, y_val, yf_train, yf_val = train_test_split(
+        X_train, y_train, yf_train,
         test_size=0.2,
         random_state=42,
         stratify=stratify_train,
@@ -827,14 +1002,16 @@ def main():
     # STEP 6: Train base model
     # -----------------------------------------------------------------
     base_model, history = train_base_model(
-        X_train, y_train, X_val, y_val, config, class_weights
+        X_train, y_train, yf_train,
+        X_val, y_val, yf_val,
+        config, class_weights,
     )
     plot_training_history(history, "Base Model Training")
 
     # -----------------------------------------------------------------
-    # STEP 7: Evaluate
+    # STEP 7: Evaluate both output heads
     # -----------------------------------------------------------------
-    base_results = evaluate_model(base_model, X_test, y_test, "Base Model")
+    base_results = evaluate_model(base_model, X_test, y_test, yf_test, "Base Model")
 
     # -----------------------------------------------------------------
     # STEP 8: Export to TFLite
@@ -859,7 +1036,7 @@ def main():
         print(f"\n  Personalizing for: {user_id}")
 
         user_scaler = user_scalers.get(user_id, global_scaler)
-        user_X, user_y, user_y_seq = prepare_training_data(
+        user_X, user_y, user_y_seq, user_yf, _ = prepare_training_data(
             user_df, config, scaler=user_scaler
         )
 
@@ -868,20 +1045,21 @@ def main():
             continue
 
         personalized_model, ft_history = fine_tune_for_user(
-            config.BASE_MODEL_PATH, user_X, user_y, user_id, config
+            config.BASE_MODEL_PATH, user_X, user_y, user_yf, user_id, config
         )
         plot_training_history(ft_history, f"Fine-tuning {user_id}")
 
-        # Compare base vs personalized on user data
-        user_X_train, user_X_test, user_y_train, user_y_test = train_test_split(
-            user_X, user_y, test_size=0.2, random_state=42,
-        )
+        # Compare base vs personalized on user data (current head only)
+        user_X_train, user_X_test, user_y_train, user_y_test, user_yf_train, user_yf_test = \
+            train_test_split(user_X, user_y, user_yf, test_size=0.2, random_state=42)
 
         base_pred = base_model.predict(user_X_test, verbose=0)
-        base_acc = accuracy_score(np.argmax(user_y_test, axis=1), np.argmax(base_pred, axis=1))
+        base_acc = accuracy_score(
+            np.argmax(user_y_test, axis=1), np.argmax(base_pred[0], axis=1)
+        )
 
         pers_results = evaluate_model(
-            personalized_model, user_X_test, user_y_test,
+            personalized_model, user_X_test, user_y_test, user_yf_test,
             f"Personalized ({user_id})"
         )
 
@@ -890,9 +1068,9 @@ def main():
         else:
             improvement = 0.0
 
-        print(f"\n  Base accuracy:         {base_acc:.4f}")
-        print(f"  Personalized accuracy: {pers_results['accuracy']:.4f}")
-        print(f"  Improvement:           {improvement:+.2f}%")
+        print(f"\n  Base accuracy (current head):         {base_acc:.4f}")
+        print(f"  Personalized accuracy (current head): {pers_results['accuracy']:.4f}")
+        print(f"  Improvement:                          {improvement:+.2f}%")
 
     # -----------------------------------------------------------------
     # STEP 10: Save summary
@@ -921,8 +1099,10 @@ def main():
             'feature_columns': config.FEATURE_COLUMNS,
         },
         'base_model': {
-            'accuracy': float(base_results['accuracy']),
+            'current_accuracy': float(base_results['accuracy']),
+            'future_accuracy':  float(base_results['future_accuracy']),
             'classification_report': base_results['report_dict'],
+            'future_classification_report': base_results['future_report_dict'],
             'model_path': config.BASE_MODEL_PATH,
             'tflite_path': config.TFLITE_MODEL_PATH,
         },
@@ -945,9 +1125,11 @@ def main():
     print(f"    User scalers:      scalers/user_scalers.pkl")
     print(f"    Training summary:  results/training_summary.json")
     print(f"\n  Results:")
-    print(f"    Base model accuracy: {base_results['accuracy']:.4f} "
+    print(f"    Current fatigue accuracy: {base_results['accuracy']:.4f} "
           f"({base_results['accuracy'] * 100:.2f}%)")
-    print(f"\n  Classification Report (Base Model):")
+    print(f"    Future  fatigue accuracy: {base_results['future_accuracy']:.4f} "
+          f"({base_results['future_accuracy'] * 100:.2f}%)")
+    print(f"\n  [Current] Classification Report (Base Model):")
     for line in base_results['report_str'].splitlines():
         print(f"    {line}")
     print(f"\n  Next steps for Android deployment:")
@@ -955,12 +1137,15 @@ def main():
     print(f"    2. Copy scalers/scaler_params.json → app/src/main/assets/")
     print(f"    3. Implement sequence buffering in Android (collect {config.SEQ_LENGTH}")
     print(f"       consecutive window summaries before running inference)")
-    print(f"    4. Model outputs [P(Low), P(High)] — use P(High) to determine")
-    print(f"       4 fatigue levels using thresholds in scaler_params.json:")
+    print(f"    4. Model now has TWO output tensors:")
+    print(f"         output[0] → current_fatigue [P(Low), P(High)]")
+    print(f"         output[1] → future_fatigue  [P(Low), P(High)]")
+    print(f"    5. Apply FATIGUE_THRESHOLDS to each P(High) to get 4-level labels:")
     print(f"         P(High) < 0.25 → Mild")
     print(f"         P(High) < 0.50 → Moderate")
     print(f"         P(High) < 0.75 → High")
     print(f"         P(High) >= 0.75 → Critical")
+    print(f"    6. Derive trend from current→future level pair for user insight")
     print(f"\n  Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 

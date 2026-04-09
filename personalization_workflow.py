@@ -58,7 +58,8 @@ class Config:
         'high_max':     0.75,
     }
 
-    # 30 features matching the current CSV schema (35 cols - 5 metadata/label cols)
+    # 19 PPG-only features — accelerometer and activity features removed.
+    # Must stay in sync with hybrid_training_complete.py FEATURE_COLUMNS.
     FEATURE_COLUMNS = [
         # Heart Rate (7)
         "mean_hr_bpm", "hr_std_bpm", "hr_min_bpm", "hr_max_bpm",
@@ -69,12 +70,6 @@ class Config:
         "lf_power_ms2", "hf_power_ms2", "lf_hf_ratio", "total_power_ms2",
         # SpO2 (3)
         "spo2_mean_pct", "spo2_min_pct", "spo2_std_pct",
-        # Accelerometer (9)
-        "accel_x_mean", "accel_y_mean", "accel_z_mean",
-        "accel_x_var", "accel_y_var", "accel_z_var",
-        "accel_mag_mean", "accel_mag_var", "accel_peak",
-        # Activity Context (2)
-        "total_steps", "cadence_spm",
     ]
 
     # Session boundary: gaps larger than this (seconds) split segments
@@ -157,7 +152,8 @@ def load_user_data(filepath, config):
 
     print(f"  Rows: {len(df)}")
     print(f"  Fatigue levels: {df['fatigue_level'].value_counts().sort_index().to_dict()}")
-    print(f"  RPE values: {df['rpe_raw'].value_counts().sort_index().to_dict()}")
+    if 'rpe_raw' in df.columns:
+        print(f"  RPE values: {df['rpe_raw'].value_counts().sort_index().to_dict()}")
 
     return df
 
@@ -176,13 +172,15 @@ def create_sequences_from_segments(df, config, scaler):
 
     Returns:
         X_seq: np.array of shape (n_sequences, SEQ_LENGTH, n_features)
-        y_seq: np.array of integer fatigue labels
+        y_seq: np.array of integer current fatigue labels
+        y_future_seq: np.array of integer future fatigue labels (next window)
     """
     seq_len = config.SEQ_LENGTH
     step = seq_len - config.SEQ_OVERLAP
 
     X_sequences = []
     y_labels = []
+    y_future_labels = []
 
     for seg_id, segment in df.groupby('segment_id'):
         if len(segment) < seq_len:
@@ -195,12 +193,17 @@ def create_sequences_from_segments(df, config, scaler):
 
         for i in range(0, len(X_scaled) - seq_len + 1, step):
             X_sequences.append(X_scaled[i:i + seq_len])
-            y_labels.append(y_raw[i + seq_len - 1])  # Label = last window
+            y_labels.append(y_raw[i + seq_len - 1])  # current label = last window
+            # Future label = next window after the sequence; repeat last if at end
+            if i + seq_len < len(y_raw):
+                y_future_labels.append(y_raw[i + seq_len])
+            else:
+                y_future_labels.append(y_raw[i + seq_len - 1])
 
     if len(X_sequences) == 0:
-        return np.array([]), np.array([])
+        return np.array([]), np.array([]), np.array([])
 
-    return np.array(X_sequences), np.array(y_labels)
+    return np.array(X_sequences), np.array(y_labels), np.array(y_future_labels)
 
 
 # =============================================================================
@@ -305,34 +308,46 @@ class UserPersonalization:
         """
         Run prediction on pre-normalized sequences.
 
+        The model returns two output tensors:
+          outputs[0] → current_fatigue probabilities
+          outputs[1] → future_fatigue probabilities
+
         Args:
             X_sequences: Shape (n_samples, SEQ_LENGTH, n_features), already scaled
             model: Model to use (defaults to base model)
 
         Returns:
-            predictions: Integer class labels
-            probabilities: Softmax probabilities per class
+            current_preds: Integer class labels for current fatigue
+            future_preds:  Integer class labels for future fatigue
+            current_probs: Softmax probabilities for current fatigue
+            future_probs:  Softmax probabilities for future fatigue
         """
         model = model or self.base_model
-        probs = model.predict(X_sequences, verbose=0)
-        preds = np.argmax(probs, axis=1)
-        return preds, probs
+        outputs = model.predict(X_sequences, verbose=0)
+        current_probs = outputs[0]
+        future_probs  = outputs[1]
+        current_preds = np.argmax(current_probs, axis=1)
+        future_preds  = np.argmax(future_probs,  axis=1)
+        return current_preds, future_preds, current_probs, future_probs
 
     # -----------------------------------------------------------------
     # Step 3: Fine-tuning
     # -----------------------------------------------------------------
 
-    def fine_tune(self, X_train, y_train, X_val, y_val, user_id):
+    def fine_tune(self, X_train, y_train, y_future_train,
+                  X_val, y_val, y_future_val, user_id):
         """
-        Fine-tune the base model's classification head for this user.
+        Fine-tune the base model's classification heads for this user.
 
-        Freezes CNN + LSTM layers (general pattern recognition) and
-        retrains only the last 3 layers (dense_1, dropout_2, output)
+        Freezes the shared backbone (Conv1D + LSTM) and retrains only
+        the shared dense layer and both output heads (last 4 layers)
         with a low learning rate on the user's personal data.
 
         Args:
-            X_train, y_train: Training sequences (normalized, one-hot)
-            X_val, y_val: Validation sequences
+            X_train, y_train: Training sequences (normalized, one-hot current)
+            y_future_train: One-hot future labels for training
+            X_val, y_val: Validation sequences (one-hot current)
+            y_future_val: One-hot future labels for validation
             user_id: User identifier
 
         Returns:
@@ -346,14 +361,26 @@ class UserPersonalization:
         # Load a fresh copy of the base model
         model = load_model(self.base_model_path)
 
-        # Freeze everything except last 3 layers (dense_1, dropout_2, output)
-        for layer in model.layers[:-3]:
+        # Freeze backbone (input, conv1d_1, bn_1, conv1d_2, bn_2, lstm,
+        # dropout_1). Keep dense_shared, dropout_shared, current_fatigue,
+        # future_fatigue trainable (last 4 layers).
+        for layer in model.layers[:-4]:
             layer.trainable = False
 
         model.compile(
             optimizer=Adam(learning_rate=config.FINETUNE_LR),
-            loss='categorical_crossentropy',
-            metrics=['accuracy'],
+            loss={
+                'current_fatigue': 'categorical_crossentropy',
+                'future_fatigue':  'categorical_crossentropy',
+            },
+            loss_weights={
+                'current_fatigue': 1.0,
+                'future_fatigue':  0.5,
+            },
+            metrics={
+                'current_fatigue': 'accuracy',
+                'future_fatigue':  'accuracy',
+            },
         )
 
         trainable = sum(1 for l in model.layers if l.trainable)
@@ -370,8 +397,12 @@ class UserPersonalization:
         ]
 
         history = model.fit(
-            X_train, y_train,
-            validation_data=(X_val, y_val),
+            X_train,
+            {'current_fatigue': y_train, 'future_fatigue': y_future_train},
+            validation_data=(
+                X_val,
+                {'current_fatigue': y_val, 'future_fatigue': y_future_val},
+            ),
             epochs=config.FINETUNE_EPOCHS,
             batch_size=config.FINETUNE_BATCH_SIZE,
             callbacks=callbacks,
@@ -414,16 +445,21 @@ class UserPersonalization:
         user_scaler = self.create_user_scaler(df, user_id)
 
         # --- Build sequences with GLOBAL scaler ---
-        X_global, y_seq = create_sequences_from_segments(df, config, self.global_scaler)
+        X_global, y_seq, y_future_seq = create_sequences_from_segments(
+            df, config, self.global_scaler
+        )
         if len(X_global) < 10:
             print(f"\n  Only {len(X_global)} sequences — not enough to compare.")
             return None
 
         # --- Build sequences with USER scaler ---
-        X_user, _ = create_sequences_from_segments(df, config, user_scaler)
+        X_user, _, y_future_user = create_sequences_from_segments(
+            df, config, user_scaler
+        )
 
         # --- One-hot encode ---
-        y_onehot = to_categorical(y_seq, num_classes=config.NUM_CLASSES)
+        y_onehot        = to_categorical(y_seq,        num_classes=config.NUM_CLASSES)
+        y_future_onehot = to_categorical(y_future_seq, num_classes=config.NUM_CLASSES)
 
         # --- Split (same indices for fair comparison) ---
         indices = np.arange(len(X_global))
@@ -439,14 +475,15 @@ class UserPersonalization:
         y_true = y_seq[idx_test]
 
         # --- Approach 1: Base model + global scaler ---
+        # Accuracy is measured on the current_fatigue head only.
         print("\n--- Approach 1: Base Model + Global Normalization ---")
-        preds_global, _ = self.predict(X_global[idx_test])
+        preds_global, _, _, _ = self.predict(X_global[idx_test])
         acc_global = accuracy_score(y_true, preds_global)
         print(f"  Accuracy: {acc_global:.4f} ({acc_global * 100:.1f}%)")
 
         # --- Approach 2: Base model + user scaler ---
         print("\n--- Approach 2: Base Model + User Normalization ---")
-        preds_user, _ = self.predict(X_user[idx_test])
+        preds_user, _, _, _ = self.predict(X_user[idx_test])
         acc_user = accuracy_score(y_true, preds_user)
         imp_user = ((acc_user - acc_global) / max(acc_global, 1e-8)) * 100
         print(f"  Accuracy: {acc_user:.4f} ({acc_user * 100:.1f}%)")
@@ -457,28 +494,32 @@ class UserPersonalization:
         if len(idx_train) >= 20:
             print("\n--- Approach 3: Fine-Tuned + User Normalization ---")
 
-            X_ft_train = X_user[idx_train]
-            y_ft_train = y_onehot[idx_train]
+            X_ft_train      = X_user[idx_train]
+            y_ft_train      = y_onehot[idx_train]
+            yf_ft_train     = y_future_onehot[idx_train]
 
             # Further split train → train + val for fine-tuning
-            X_ft_tr, X_ft_val, y_ft_tr, y_ft_val = train_test_split(
-                X_ft_train, y_ft_train, test_size=0.2, random_state=42,
+            X_ft_tr, X_ft_val, y_ft_tr, y_ft_val, yf_ft_tr, yf_ft_val = train_test_split(
+                X_ft_train, y_ft_train, yf_ft_train, test_size=0.2, random_state=42,
             )
 
-            ft_model, _ = self.fine_tune(X_ft_tr, y_ft_tr, X_ft_val, y_ft_val, user_id)
+            ft_model, _ = self.fine_tune(
+                X_ft_tr, y_ft_tr, yf_ft_tr,
+                X_ft_val, y_ft_val, yf_ft_val,
+                user_id,
+            )
 
-            preds_ft, _ = self.predict(X_user[idx_test], model=ft_model)
+            preds_ft, _, _, _ = self.predict(X_user[idx_test], model=ft_model)
             acc_ft = accuracy_score(y_true, preds_ft)
             imp_ft = ((acc_ft - acc_global) / max(acc_global, 1e-8)) * 100
             print(f"  Accuracy: {acc_ft:.4f} ({acc_ft * 100:.1f}%)")
             print(f"  vs global: {imp_ft:+.1f}%")
 
             # Classification report for best approach
-            best_preds = preds_ft
-            print(f"\n  Classification Report (Fine-Tuned):")
-            present = sorted(set(y_true) | set(best_preds))
+            print(f"\n  Classification Report (Fine-Tuned, current head):")
+            present = sorted(set(y_true) | set(preds_ft))
             print(classification_report(
-                y_true, best_preds,
+                y_true, preds_ft,
                 labels=present,
                 target_names=[class_names[i] for i in present],
                 zero_division=0,
