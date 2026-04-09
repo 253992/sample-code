@@ -2,21 +2,6 @@
 PERSONALIZATION WORKFLOW
 ========================
 
-This script personalizes the base fatigue model for individual users.
-Run AFTER training the base model with hybrid_training_complete.py.
-
-Usage:
-    1. Train base model:   python hybrid_training_complete.py
-    2. Personalize:        python personalization_workflow.py --user_data user_features.csv --user_id user_01
-
-The workflow:
-    - Loads the base model and global scaler from Phase 1
-    - Creates a user-specific scaler from the user's calibration data
-    - Compares 3 approaches: global norm, user norm, fine-tuning
-    - Exports the best personalized model as TFLite for Android
-
-Input:  User's features.csv from a calibration session (~30-40 min workout)
-Output: models/user_{id}_model.h5, scalers/user_{id}_scaler.json
 """
 
 import numpy as np
@@ -58,7 +43,7 @@ class Config:
         'high_max':     0.75,
     }
 
-    # 19 PPG-only features — accelerometer and activity features removed.
+    # 19 PPG-only features 
     # Must stay in sync with hybrid_training_complete.py FEATURE_COLUMNS.
     FEATURE_COLUMNS = [
         # Heart Rate (7)
@@ -159,22 +144,6 @@ def load_user_data(filepath, config):
 
 
 def create_sequences_from_segments(df, config, scaler):
-    """
-    Group consecutive windows into sequences, respecting segment boundaries.
-
-    Segments are continuous blocks of data separated by large time gaps.
-    Sequences never cross segment boundaries.
-
-    Args:
-        df: Sorted dataframe with segment_id column
-        config: Configuration object
-        scaler: Fitted StandardScaler
-
-    Returns:
-        X_seq: np.array of shape (n_sequences, SEQ_LENGTH, n_features)
-        y_seq: np.array of integer current fatigue labels
-        y_future_seq: np.array of integer future fatigue labels (next window)
-    """
     seq_len = config.SEQ_LENGTH
     step = seq_len - config.SEQ_OVERLAP
 
@@ -221,13 +190,6 @@ class UserPersonalization:
     """
 
     def __init__(self, base_model_path=None, global_scaler_path=None):
-        """
-        Load the base model and global scaler from Phase 1.
-
-        Args:
-            base_model_path: Path to trained base model (.h5)
-            global_scaler_path: Path to global scaler (.pkl)
-        """
         base_model_path = base_model_path or config.BASE_MODEL_PATH
         global_scaler_path = global_scaler_path or config.GLOBAL_SCALER_PATH
 
@@ -254,20 +216,6 @@ class UserPersonalization:
     # -----------------------------------------------------------------
 
     def create_user_scaler(self, df, user_id):
-        """
-        Fit a StandardScaler on this user's feature data.
-
-        This captures the user's personal baseline so that their
-        HR of 90 bpm is normalized relative to THEIR average,
-        not the global population average.
-
-        Args:
-            df: User's dataframe with feature columns
-            user_id: User identifier string
-
-        Returns:
-            scaler: Fitted StandardScaler
-        """
         print(f"\nCreating scaler for: {user_id}")
 
         scaler = StandardScaler()
@@ -305,23 +253,6 @@ class UserPersonalization:
     # -----------------------------------------------------------------
 
     def predict(self, X_sequences, model=None):
-        """
-        Run prediction on pre-normalized sequences.
-
-        The model returns two output tensors:
-          outputs[0] → current_fatigue probabilities
-          outputs[1] → future_fatigue probabilities
-
-        Args:
-            X_sequences: Shape (n_samples, SEQ_LENGTH, n_features), already scaled
-            model: Model to use (defaults to base model)
-
-        Returns:
-            current_preds: Integer class labels for current fatigue
-            future_preds:  Integer class labels for future fatigue
-            current_probs: Softmax probabilities for current fatigue
-            future_probs:  Softmax probabilities for future fatigue
-        """
         model = model or self.base_model
         outputs = model.predict(X_sequences, verbose=0)
         current_probs = outputs[0]
@@ -336,24 +267,6 @@ class UserPersonalization:
 
     def fine_tune(self, X_train, y_train, y_future_train,
                   X_val, y_val, y_future_val, user_id):
-        """
-        Fine-tune the base model's classification heads for this user.
-
-        Freezes the shared backbone (Conv1D + LSTM) and retrains only
-        the shared dense layer and both output heads (last 4 layers)
-        with a low learning rate on the user's personal data.
-
-        Args:
-            X_train, y_train: Training sequences (normalized, one-hot current)
-            y_future_train: One-hot future labels for training
-            X_val, y_val: Validation sequences (one-hot current)
-            y_future_val: One-hot future labels for validation
-            user_id: User identifier
-
-        Returns:
-            model: Fine-tuned model
-            history: Training history
-        """
         print(f"\nFine-tuning for: {user_id}")
         print(f"  Train: {len(X_train)} sequences")
         print(f"  Val:   {len(X_val)} sequences")
@@ -421,19 +334,6 @@ class UserPersonalization:
     # -----------------------------------------------------------------
 
     def compare_approaches(self, df, user_id):
-        """
-        Compare global norm vs user norm vs fine-tuning on the same data.
-
-        Uses an 80/20 split: trains fine-tuning on 80%, evaluates
-        all three approaches on the held-out 20%.
-
-        Args:
-            df: User's cleaned dataframe (sorted, NaN-free, with segment_id)
-            user_id: User identifier
-
-        Returns:
-            results: Dict with accuracy for each approach
-        """
         print(f"\n{'=' * 60}")
         print(f"COMPARING PERSONALIZATION APPROACHES")
         print(f"User: {user_id}")

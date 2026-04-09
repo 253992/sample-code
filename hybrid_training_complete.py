@@ -39,33 +39,22 @@ class Config:
     """Model and training configuration"""
 
     # --- Sequence construction ---
-    # Each row in the CSV is already a ~48-second window summary.
-    # SEQ_LENGTH consecutive windows form one training sample.
-    # With ~69s between windows, SEQ_LENGTH=5 covers ~5-6 minutes.
     SEQ_LENGTH = 5
     SEQ_OVERLAP = 2  # Overlapping windows between sequences for data augmentation
 
     # --- Classification ---
     # Binary: 0=Low fatigue (RPE 0-4), 1=High fatigue (RPE 5-10)
-    # The model outputs P(High), which is mapped to 4 app-facing levels
-    # using FATIGUE_THRESHOLDS in the Android app.
     NUM_CLASSES = 2
-    BINARY_LABEL_MAP = {0: 0, 1: 0, 2: 1, 3: 1}  # Original 4-class → binary
+    BINARY_LABEL_MAP = {0: 0, 1: 0, 2: 1, 3: 1}
 
-    # App-side thresholds: P(High) → 4 fatigue levels for display
-    # These are saved to scaler_params.json for Android to use
     FATIGUE_THRESHOLDS = {
-        'mild_max':     0.25,  # P(High) < 0.25 → Mild (level 0)
-        'moderate_max': 0.50,  # P(High) < 0.50 → Moderate (level 1)
-        'high_max':     0.75,  # P(High) < 0.75 → High (level 2)
-                               # P(High) >= 0.75 → Critical (level 3)
+        'mild_max':     0.25,  
+        'moderate_max': 0.50,  
+        'high_max':     0.75,  
+                               
     }
 
     # --- Feature columns (19 PPG-only inputs) ---
-    # Accelerometer and activity features removed: session analysis showed
-    # accel_mag_var and cadence_spm are severe outliers (Z = -2.78 / -2.65)
-    # between training data and real app sessions, causing erratic predictions.
-    # HR, HRV, and SpO2 features are stable across sessions (all within ±1.2σ).
     FEATURE_COLUMNS = [
         # Heart Rate (7)
         "mean_hr_bpm", "hr_std_bpm", "hr_min_bpm", "hr_max_bpm",
@@ -107,17 +96,6 @@ config = Config()
 # =============================================================================
 
 def load_and_preprocess_data(filepath, config):
-    """
-    Load CSV and perform initial preprocessing.
-
-    Args:
-        filepath: Path to features CSV
-        config: Configuration object
-
-    Returns:
-        df: Preprocessed dataframe
-        activity_encoder: Fitted LabelEncoder for activity_label
-    """
     print("Loading data...")
     df = pd.read_csv(filepath)
 
@@ -171,15 +149,11 @@ def load_and_preprocess_data(filepath, config):
     df['fatigue_level'] = df['fatigue_level'].astype(int)
 
     # --- Remap to binary labels ---
-    # Original: 0=Mild, 1=Moderate, 2=High, 3=Critical
-    # Binary:   0=Low (Mild+Moderate), 1=High (High+Critical)
-    df['fatigue_level_original'] = df['fatigue_level']  # Keep original for analysis
+    df['fatigue_level_original'] = df['fatigue_level']  
     df['fatigue_level'] = df['fatigue_level'].map(config.BINARY_LABEL_MAP)
     print(f"  Remapped to binary: {df['fatigue_level'].value_counts().sort_index().to_dict()}")
 
     # --- Detect session boundaries from large time gaps ---
-    # Gaps > threshold within the same user/session are treated as
-    # separate segments. Sequences never cross segment boundaries.
     SESSION_GAP_THRESHOLD_S = 45.0
     df['segment_id'] = 0
     for (uid, sid), group in df.groupby(['user_id', 'session_id']):
@@ -203,16 +177,6 @@ def load_and_preprocess_data(filepath, config):
 
 
 def create_global_scaler(df, config):
-    """
-    Create and save a global StandardScaler fitted on all data.
-
-    Args:
-        df: Dataframe with feature columns
-        config: Configuration object
-
-    Returns:
-        scaler: Fitted StandardScaler
-    """
     print("\nCreating global scaler...")
     scaler = StandardScaler()
     X_raw = df[config.FEATURE_COLUMNS].values
@@ -237,17 +201,6 @@ def create_global_scaler(df, config):
 
 
 def create_user_scalers(df, config, min_samples=30):
-    """
-    Create per-user StandardScalers for personalization.
-
-    Args:
-        df: Dataframe with feature columns and user_id
-        config: Configuration object
-        min_samples: Minimum windows needed to create a user scaler
-
-    Returns:
-        user_scalers: Dict of {user_id: StandardScaler}
-    """
     print("\nCreating user-specific scalers...")
     user_scalers = {}
 
@@ -286,23 +239,6 @@ def create_user_scalers(df, config, min_samples=30):
 # =============================================================================
 
 def create_sequences(df, config, scaler):
-    """
-    Group consecutive window summaries into sequences for the model.
-
-    Each row in df is already a pre-computed window (~48 seconds).
-    This function groups SEQ_LENGTH consecutive windows into one
-    training sample, respecting session boundaries.
-
-    Args:
-        df: Dataframe sorted by user/session/time
-        config: Configuration object
-        scaler: Fitted StandardScaler for normalization
-
-    Returns:
-        X_seq: np.array of shape (num_sequences, SEQ_LENGTH, num_features)
-        y_seq: np.array of integer current fatigue labels
-        y_future_seq: np.array of integer future fatigue labels (next window)
-    """
     print("\nConstructing sequences...")
 
     num_features = len(config.FEATURE_COLUMNS)
@@ -333,8 +269,6 @@ def create_sequences(df, config, scaler):
             y_labels.append(seq_labels[-1])
 
             # Future label: fatigue level of the NEXT window after this sequence.
-            # If we are at the end of the session, repeat the current label
-            # (fatigue is assumed to hold steady when no future data exists).
             if i + seq_len < len(y_raw):
                 y_future_labels.append(y_raw[i + seq_len])
             else:
@@ -353,22 +287,6 @@ def create_sequences(df, config, scaler):
 
 
 def prepare_training_data(df, config, scaler=None, user_id=None):
-    """
-    Complete data preparation pipeline.
-
-    Args:
-        df: Raw dataframe
-        config: Configuration object
-        scaler: Pre-fitted scaler (if None, loads global scaler)
-        user_id: If provided, uses user-specific scaler
-
-    Returns:
-        X_seq: Prepared sequences
-        y_encoded: One-hot encoded current labels
-        y_seq: Original integer current labels (for stratification)
-        y_future_encoded: One-hot encoded future labels
-        y_future_seq: Original integer future labels
-    """
     print("\nPreparing training data...")
 
     if scaler is None:
@@ -398,34 +316,6 @@ def prepare_training_data(df, config, scaler=None, user_id=None):
 # =============================================================================
 
 def build_base_model(config):
-    """
-    Build the CNN-LSTM hybrid model for fatigue classification + forecasting.
-
-    Input shape: (SEQ_LENGTH, num_features)
-      - SEQ_LENGTH consecutive window summaries
-      - Each window has num_features pre-computed physiological metrics
-
-    Architecture:
-      Conv1D → BN → Conv1D → BN → LSTM → Dense(shared)
-                                              │            │
-                                       current_fatigue  future_fatigue
-                                       (what is now)    (what comes next)
-
-    The shared backbone (Conv1D + LSTM) learns temporal patterns useful for
-    both classifying the current state and forecasting the next one.
-    Two separate Dense output heads are trained simultaneously:
-      - current_fatigue: P(High) at the end of the input sequence
-      - future_fatigue:  P(High) at the next window (~48-69 s ahead)
-
-    The future head uses half the loss weight of the current head because
-    forecasting is inherently noisier than classifying an observed state.
-
-    Args:
-        config: Configuration object
-
-    Returns:
-        model: Compiled Keras model (two outputs)
-    """
     print("\nBuilding base model...")
 
     num_features = len(config.FEATURE_COLUMNS)
@@ -434,8 +324,6 @@ def build_base_model(config):
     inputs = Input(shape=(config.SEQ_LENGTH, num_features), name='input')
 
     # --- Temporal feature extraction ---
-    # Conv1D kernel slides across consecutive windows, learning local
-    # patterns like "HR rising while HRV drops over 3 windows".
     x = Conv1D(
         config.CONV_FILTERS,
         kernel_size=3,
@@ -455,14 +343,10 @@ def build_base_model(config):
     x = BatchNormalization(name='bn_2')(x)
 
     # --- Temporal sequence modeling ---
-    # LSTM captures longer-range progression across the full sequence.
     x = LSTM(config.LSTM_UNITS, unroll=True, name='lstm')(x)
     x = Dropout(config.DROPOUT_RATE, name='dropout_1')(x)
 
     # --- Shared representation ---
-    # Both output heads branch from this shared dense layer so the
-    # backbone is forced to encode the fatigue trajectory, not just
-    # the current state.
     shared = Dense(config.DENSE_UNITS, activation='relu', name='dense_shared')(x)
     shared = Dropout(config.DROPOUT_RATE / 2, name='dropout_shared')(shared)
 
@@ -482,8 +366,6 @@ def build_base_model(config):
             'current_fatigue': 'categorical_crossentropy',
             'future_fatigue':  'categorical_crossentropy',
         },
-        # Future prediction is noisier so it contributes less to the
-        # total loss — keeps the backbone optimised for current accuracy.
         loss_weights={
             'current_fatigue': 1.0,
             'future_fatigue':  0.5,
@@ -507,34 +389,11 @@ def build_base_model(config):
 def train_base_model(X_train, y_train, y_future_train,
                      X_val, y_val, y_future_val,
                      config, class_weights=None):
-    """
-    Train the base model on all users' data.
-
-    Args:
-        X_train, y_train: Training features and current labels
-        y_future_train: One-hot future labels for training
-        X_val, y_val: Validation features and current labels
-        y_future_val: One-hot future labels for validation
-        config: Configuration object
-        class_weights: Optional dict for imbalanced classes
-
-    Returns:
-        model: Trained model
-        history: Training history
-    """
     print("\n" + "=" * 70)
     print("TRAINING BASE MODEL")
     print("=" * 70)
 
     model = build_base_model(config)
-
-    # Keras 3 does not support class_weight or sample_weight for multi-output
-    # models — compile_utils.py resolves weights by positional index and raises
-    # KeyError: 0 when the structure doesn't match.
-    #
-    # Workaround: embed sample weights directly in a tf.data.Dataset as the
-    # third element of each (x, y, w) tuple.  Keras reads the weight from the
-    # dataset without going through compile_utils path resolution.
     if class_weights is not None:
         train_class_indices = np.argmax(y_train, axis=1)
         sw_train = np.array([class_weights[i] for i in train_class_indices],
@@ -612,25 +471,6 @@ def train_base_model(X_train, y_train, y_future_train,
 
 
 def fine_tune_for_user(base_model_path, user_X, user_y, user_y_future, user_id, config):
-    """
-    Fine-tune the base model for a specific user.
-
-    Freezes the shared backbone (Conv1D + LSTM) and retrains only the
-    shared dense layer and both output heads with a low learning rate
-    on the user's personal data.
-
-    Args:
-        base_model_path: Path to trained base model
-        user_X: User's feature sequences (normalized)
-        user_y: User's one-hot current labels
-        user_y_future: User's one-hot future labels
-        user_id: User identifier
-        config: Configuration object
-
-    Returns:
-        model: Fine-tuned model
-        history: Training history
-    """
     print(f"\n{'=' * 70}")
     print(f"FINE-TUNING FOR USER: {user_id}")
     print(f"{'=' * 70}")
@@ -700,19 +540,6 @@ def fine_tune_for_user(base_model_path, user_X, user_y, user_y_future, user_id, 
 # =============================================================================
 
 def evaluate_model(model, X_test, y_test, y_future_test, model_name="Model"):
-    """
-    Evaluate model and generate reports for both output heads.
-
-    Args:
-        model: Trained model (two outputs: current_fatigue, future_fatigue)
-        X_test: Test features
-        y_test: One-hot current labels
-        y_future_test: One-hot future labels
-        model_name: Label for reports
-
-    Returns:
-        results: Dict with accuracy, predictions, etc.
-    """
     print(f"\n{'=' * 70}")
     print(f"EVALUATING: {model_name.upper()}")
     print(f"{'=' * 70}")
@@ -799,8 +626,6 @@ def evaluate_model(model, X_test, y_test, y_future_test, model_name="Model"):
     plt.close()
 
     # --- Trend transition summary ---
-    # Shows how often the model predicts each current→future combination,
-    # giving a picture of the trend insights the app will display.
     fatigue_names = ["Mild", "Moderate", "High", "Critical"]
     thresholds = config.FATIGUE_THRESHOLDS
 
@@ -885,13 +710,6 @@ def plot_training_history(history, title="Training History"):
 # =============================================================================
 
 def export_to_tflite(model_path, output_path):
-    """
-    Convert Keras model to TensorFlow Lite for Android deployment.
-
-    Args:
-        model_path: Path to .h5 model
-        output_path: Path for .tflite output
-    """
     print("\n" + "=" * 70)
     print("CONVERTING TO TENSORFLOW LITE")
     print("=" * 70)
@@ -1071,6 +889,14 @@ def main():
         print(f"\n  Base accuracy (current head):         {base_acc:.4f}")
         print(f"  Personalized accuracy (current head): {pers_results['accuracy']:.4f}")
         print(f"  Improvement:                          {improvement:+.2f}%")
+
+        user_model_path = f'models/user_{user_id}_model.h5'
+        if pers_results['accuracy'] >= base_acc:
+            print(f"  Decision: keeping personalized model.")
+        else:
+            if os.path.exists(user_model_path):
+                os.remove(user_model_path)
+            print(f"  Decision: global model is better — personalized model discarded.")
 
     # -----------------------------------------------------------------
     # STEP 10: Save summary
